@@ -73,6 +73,31 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def postprocess_decoder_output(
+    boxes: NDArray,
+    masks: NDArray,
+    image_width: int,
+    image_height: int,
+) -> tuple[NDArray, NDArray]:
+    boxes = boxes * np.array(
+        [image_width, image_height, image_width, image_height], dtype=np.float32
+    )
+    if len(masks) == 0:
+        return boxes, np.empty((0, image_height, image_width), dtype=bool)
+    masks = np.array(
+        [
+            cv2.resize(
+                mask[0],
+                dsize=(image_width, image_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            > 0.5
+            for mask in masks
+        ]
+    )
+    return boxes, masks
+
+
 def main():
     args = parse_args()
 
@@ -118,17 +143,12 @@ def main():
     output = sess_decode.run(
         None,
         {
-            "original_height": np.array(image.height, dtype=np.int64),
-            "original_width": np.array(image.width, dtype=np.int64),
             "backbone_fpn_0": backbone_fpn[0],
             "backbone_fpn_1": backbone_fpn[1],
             "backbone_fpn_2": backbone_fpn[2],
-            # "vision_pos_enc_0": vision_pos_enc[0],
-            # "vision_pos_enc_1": vision_pos_enc[1],
             "vision_pos_enc_2": vision_pos_enc[2],
             "language_mask": language_mask,
             "language_features": language_features,
-            # "language_embeds": language_embeds,
             "box_coords": box_coords,
             "box_labels": box_labels,
             "box_masks": box_masks,
@@ -142,6 +162,13 @@ def main():
     masks: NDArray = output[2]
     logger.debug("finished running decoder")
 
+    boxes, masks = postprocess_decoder_output(
+        boxes=boxes,
+        masks=masks,
+        image_width=image.width,
+        image_height=image.height,
+    )
+
     logger.debug(
         "output: {}",
         {"masks": masks.shape, "boxes": boxes.shape, "scores": scores.shape},
@@ -149,7 +176,7 @@ def main():
 
     viz = imgviz.instances2rgb(
         image=np.asarray(image),
-        masks=masks[:, 0, :, :],
+        masks=masks,
         bboxes=boxes[:, [1, 0, 3, 2]],
         labels=np.arange(len(masks)) + 1,
         captions=[f"{text_prompt}: {s:.0%}" for s in scores],
