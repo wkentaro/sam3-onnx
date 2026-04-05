@@ -13,6 +13,7 @@ from numpy.typing import NDArray
 from osam._models.yoloworld.clip import tokenize
 from torchvision.transforms import v2
 
+from infer_onnx import postprocess_decoder_output
 from infer_torch import get_replace_freqs_cis
 from sam3.model.sam3_image import Sam3Image  # type: ignore[unresolved-import]
 from sam3.model.sam3_image_processor import (  # type: ignore[unresolved-import]
@@ -157,8 +158,6 @@ class _Decoder(torch.nn.Module):
 
     def forward(
         self,
-        original_height: torch.Tensor,
-        original_width: torch.Tensor,
         vision_pos_enc_0: torch.Tensor,
         vision_pos_enc_1: torch.Tensor,
         vision_pos_enc_2: torch.Tensor,
@@ -176,33 +175,53 @@ class _Decoder(torch.nn.Module):
         geometric_prompt.box_embeddings = box_coords
         geometric_prompt.box_labels = box_labels
         geometric_prompt.box_mask = box_masks
-        state = {
-            "original_height": original_height,
-            "original_width": original_width,
-            "backbone_out": {
-                "vision_pos_enc": [
-                    vision_pos_enc_0,
-                    vision_pos_enc_1,
-                    vision_pos_enc_2,
-                ],
-                "backbone_fpn": [
-                    backbone_fpn_0,
-                    backbone_fpn_1,
-                    backbone_fpn_2,
-                ],
-                "language_mask": language_mask,
-                "language_features": language_features,
-                "language_embeds": language_embeds,
-            },
-            "geometric_prompt": geometric_prompt,
+        backbone_out = {
+            "vision_pos_enc": [
+                vision_pos_enc_0,
+                vision_pos_enc_1,
+                vision_pos_enc_2,
+            ],
+            "backbone_fpn": [
+                backbone_fpn_0,
+                backbone_fpn_1,
+                backbone_fpn_2,
+            ],
+            "language_mask": language_mask,
+            "language_features": language_features,
+            "language_embeds": language_embeds,
         }
-        result = self._processor._forward_grounding(state)
-        return result["boxes"], result["scores"], result["masks"]
+
+        outputs = self._model.forward_grounding(
+            backbone_out=backbone_out,
+            find_input=self._processor.find_stage,
+            geometric_prompt=geometric_prompt,
+            find_target=None,
+        )
+
+        out_bbox = outputs["pred_boxes"]
+        out_logits = outputs["pred_logits"]
+        out_masks = outputs["pred_masks"]
+        out_probs = out_logits.sigmoid()
+        presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(1)
+        out_probs = (out_probs * presence_score).squeeze(-1)
+
+        out_bbox = out_bbox[out_probs > self._processor.confidence_threshold]
+        out_masks = out_masks[out_probs > self._processor.confidence_threshold]
+        out_probs = out_probs[out_probs > self._processor.confidence_threshold]
+
+        # normalized xyxy boxes
+        x_c, y_c, w, h = out_bbox.unbind(-1)
+        boxes = torch.stack(
+            [x_c - 0.5 * w, y_c - 0.5 * h, x_c + 0.5 * w, y_c + 0.5 * h], dim=-1
+        )
+
+        # masks at model native resolution (no interpolation to original image size)
+        masks = out_masks.unsqueeze(1).sigmoid()
+
+        return boxes, out_probs, masks
 
 
 def _export_decoder(
-    original_height: int,
-    original_width: int,
     vision_pos_enc_0: NDArray,
     vision_pos_enc_1: NDArray,
     vision_pos_enc_2: NDArray,
@@ -223,30 +242,9 @@ def _export_decoder(
         logger.debug("exporting onnx model: {!r}", str(onnx_file))
         decoder: _Decoder = _Decoder()
 
-        # XXX: this inference is needed to make export work with if-condition with
-        # torch.compiler.is_dynamo_compiling
-        # with torch.no_grad():
-        #     output = decoder(
-        #         original_height=torch.tensor(original_height)[None].to("cuda"),
-        #         original_width=torch.tensor(original_width)[None].to("cuda"),
-        #         vision_pos_enc_0=torch.tensor(vision_pos_enc_0).to("cuda"),
-        #         vision_pos_enc_1=torch.tensor(vision_pos_enc_1).to("cuda"),
-        #         vision_pos_enc_2=torch.tensor(vision_pos_enc_2).to("cuda"),
-        #         backbone_fpn_0=torch.tensor(backbone_fpn_0).to("cuda"),
-        #         backbone_fpn_1=torch.tensor(backbone_fpn_1).to("cuda"),
-        #         backbone_fpn_2=torch.tensor(backbone_fpn_2).to("cuda"),
-        #         language_mask=torch.tensor(language_mask).to("cuda"),
-        #         language_features=torch.tensor(language_features).to("cuda"),
-        #         language_embeds=torch.tensor(language_embeds).to("cuda"),
-        #         box_coords=torch.tensor(box_coords).to("cuda"),
-        #         box_labels=torch.tensor(box_labels).to("cuda"),
-        #     )
-
         torch.onnx.export(
             decoder,
             args=(
-                torch.tensor(original_height).to("cuda"),
-                torch.tensor(original_width).to("cuda"),
                 torch.tensor(vision_pos_enc_0).to("cuda"),
                 torch.tensor(vision_pos_enc_1).to("cuda"),
                 torch.tensor(vision_pos_enc_2).to("cuda"),
@@ -262,8 +260,6 @@ def _export_decoder(
             ),
             f=onnx_file,
             input_names=[
-                "original_height",
-                "original_width",
                 "vision_pos_enc_0",
                 "vision_pos_enc_1",
                 "vision_pos_enc_2",
@@ -288,17 +284,12 @@ def _export_decoder(
     output = session.run(
         None,
         {
-            "original_height": np.array(original_height),
-            "original_width": np.array(original_width),
-            # "vision_pos_enc_0": vision_pos_enc_0,
-            # "vision_pos_enc_1": vision_pos_enc_1,
             "vision_pos_enc_2": vision_pos_enc_2,
             "backbone_fpn_0": backbone_fpn_0,
             "backbone_fpn_1": backbone_fpn_1,
             "backbone_fpn_2": backbone_fpn_2,
             "language_mask": language_mask,
             "language_features": language_features,
-            # "language_embeds": language_embeds,
             "box_coords": box_coords,
             "box_labels": box_labels,
             "box_masks": box_masks,
@@ -342,8 +333,6 @@ def main():
     box_masks = np.array([[True]], dtype=np.bool_)
 
     boxes, scores, masks = _export_decoder(
-        original_height=image.height,
-        original_width=image.width,
         vision_pos_enc_0=vision_pos_enc[0],
         vision_pos_enc_1=vision_pos_enc[1],
         vision_pos_enc_2=vision_pos_enc[2],
@@ -359,9 +348,16 @@ def main():
     )
     # }}
 
+    boxes, masks = postprocess_decoder_output(
+        boxes=boxes,
+        masks=masks,
+        image_width=image.width,
+        image_height=image.height,
+    )
+
     viz = imgviz.instances2rgb(
         image=np.asarray(image),
-        masks=masks[:, 0, :, :],
+        masks=masks,
         bboxes=boxes[:, [1, 0, 3, 2]],
         labels=np.arange(len(boxes)) + 1,
         captions=[f"{s:.2f}" for s in scores],
