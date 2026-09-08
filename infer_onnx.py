@@ -38,8 +38,45 @@ def parse_args() -> argparse.Namespace:
         const="0,0,0,0",
         help="Box prompt for segmentation in format: cx cy w h (normalized).",
     )
+    prompt_group.add_argument(
+        "--point-prompt",
+        type=str,
+        help="Exemplar point prompt to detect similar instances, "
+        "in format: x,y[;x,y...] (normalized).",
+    )
+    prompt_group.add_argument(
+        "--interactive-point-prompt",
+        type=str,
+        help="Point prompt to segment a single instance, "
+        "in format: x,y[,label][;x,y[,label]...] (normalized, label 1=fg 0=bg).",
+    )
     args = parser.parse_args()
     logger.debug("input: {}", args.__dict__)
+
+    if args.point_prompt:
+        args.point_prompt = [
+            [float(x) for x in point.split(",")]
+            for point in args.point_prompt.split(";")
+        ]
+        if not all(len(point) == 2 for point in args.point_prompt):
+            logger.error("point_prompt must have 2 values per point: x, y")
+            sys.exit(1)
+
+    if args.interactive_point_prompt:
+        args.interactive_point_prompt = [
+            [float(x) for x in point.split(",")]
+            for point in args.interactive_point_prompt.split(";")
+        ]
+        if not all(len(point) in (2, 3) for point in args.interactive_point_prompt):
+            logger.error(
+                "interactive_point_prompt must have 2 or 3 values per point: "
+                "x, y[, label]"
+            )
+            sys.exit(1)
+        args.interactive_point_prompt = [
+            point + [1] if len(point) == 2 else point
+            for point in args.interactive_point_prompt
+        ]
 
     if args.box_prompt:
         args.box_prompt = [float(x) for x in args.box_prompt.split(",")]
@@ -98,12 +135,55 @@ def postprocess_decoder_output(
     return boxes, masks
 
 
+def _infer_interactive(
+    image: PIL.Image.Image, interactive_feats: list[NDArray], points: list[list[float]]
+) -> None:
+    sess = onnxruntime.InferenceSession("models/sam3_interactive_decoder.onnx")
+
+    point_coords: NDArray[np.float32] = np.array(
+        [[point[:2] for point in points]], dtype=np.float32
+    )
+    point_labels: NDArray[np.int64] = np.array(
+        [[int(point[2]) for point in points]], dtype=np.int64
+    )
+
+    logger.debug("running interactive decoder...")
+    output = sess.run(
+        None,
+        {
+            "image_embed": interactive_feats[2],
+            "high_res_feat_0": interactive_feats[0],
+            "high_res_feat_1": interactive_feats[1],
+            "point_coords": point_coords,
+            "point_labels": point_labels,
+        },
+    )
+    assert all(isinstance(o, np.ndarray) for o in output)
+    output = typing.cast(list[NDArray], output)
+    mask_logits, mask_scores = output
+    logger.debug("finished running interactive decoder")
+
+    best: int = int(np.argmax(mask_scores[0]))
+    mask: NDArray[np.bool_] = (
+        cv2.resize(
+            mask_logits[0, best], dsize=image.size, interpolation=cv2.INTER_LINEAR
+        )
+        > 0
+    )
+    viz = imgviz.instances2rgb(
+        image=np.asarray(image),
+        masks=[mask],
+        labels=[1],
+        captions=[f"point: {mask_scores[0, best]:.0%}"],
+        font_size=max(1, min(image.size) // 40),
+    )
+    imgviz.io.pil_imshow(viz)
+
+
 def main():
     args = parse_args()
 
     sess_image = onnxruntime.InferenceSession("models/sam3_image_encoder.onnx")
-    sess_language = onnxruntime.InferenceSession("models/sam3_language_encoder.onnx")
-    sess_decode = onnxruntime.InferenceSession("models/sam3_decoder.onnx")
 
     image: PIL.Image.Image = PIL.Image.open(args.image).convert("RGB")
     logger.debug("original image size: {}", image.size)
@@ -112,12 +192,24 @@ def main():
     output = sess_image.run(
         None, {"image": np.asarray(image.resize((1008, 1008))).transpose(2, 0, 1)}
     )
-    assert len(output) == 6
+    assert len(output) == 9
     assert all(isinstance(o, np.ndarray) for o in output)
     output = typing.cast(list[NDArray], output)
     vision_pos_enc: list[NDArray] = output[:3]
-    backbone_fpn: list[NDArray] = output[3:]
+    backbone_fpn: list[NDArray] = output[3:6]
+    interactive_feats: list[NDArray] = output[6:]
     logger.debug("finished running image encoder")
+
+    if args.interactive_point_prompt:
+        _infer_interactive(
+            image=image,
+            interactive_feats=interactive_feats,
+            points=args.interactive_point_prompt,
+        )
+        return
+
+    sess_language = onnxruntime.InferenceSession("models/sam3_language_encoder.onnx")
+    sess_decode = onnxruntime.InferenceSession("models/sam3_decoder.onnx")
 
     logger.debug("running language encoder...")
     text_prompt: str = args.text_prompt if args.text_prompt else "visual"
@@ -140,6 +232,13 @@ def main():
     box_masks: NDArray[np.bool_] = np.array(
         [False] if args.box_prompt else [True], dtype=np.bool_
     ).reshape(1, 1)
+    point_coords: NDArray[np.float32] = np.array(
+        args.point_prompt if args.point_prompt else [[0, 0]], dtype=np.float32
+    ).reshape(-1, 1, 2)
+    point_labels: NDArray[np.int64] = np.ones((len(point_coords), 1), dtype=np.int64)
+    point_masks: NDArray[np.bool_] = np.full(
+        (1, len(point_coords)), not args.point_prompt, dtype=np.bool_
+    )
     output = sess_decode.run(
         None,
         {
@@ -152,6 +251,9 @@ def main():
             "box_coords": box_coords,
             "box_labels": box_labels,
             "box_masks": box_masks,
+            "point_coords": point_coords,
+            "point_labels": point_labels,
+            "point_masks": point_masks,
         },
     )
     assert len(output) == 3

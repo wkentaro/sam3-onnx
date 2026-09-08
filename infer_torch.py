@@ -35,7 +35,9 @@ def main() -> None:
         build_sam3_image_model,
     )
 
-    model: Sam3Image = build_sam3_image_model()
+    model: Sam3Image = build_sam3_image_model(
+        enable_inst_interactivity=bool(args.interactive_point_prompt)
+    )
 
     if 0:
         with torch.no_grad():
@@ -46,6 +48,24 @@ def main() -> None:
     image: PIL.Image.Image = PIL.Image.open(args.image).convert("RGB")
     state = processor.set_image(image)
 
+    if args.interactive_point_prompt:
+        points = np.array(args.interactive_point_prompt, dtype=np.float32)
+        masks, ious, _ = model.predict_inst(
+            state,
+            point_coords=points[:, :2] * [image.width, image.height],
+            point_labels=points[:, 2].astype(np.int64),
+            multimask_output=True,
+        )
+        best = int(np.argmax(ious))
+        viz = imgviz.instances2rgb(
+            image=np.asarray(image),
+            masks=[masks[best] > 0],
+            labels=[1],
+            captions=[f"point: {ious[best]:.0%}"],
+        )
+        imgviz.io.pil_imshow(viz)
+        return
+
     if args.text_prompt:
         output = processor.set_text_prompt(prompt=args.text_prompt, state=state)
     elif args.box_prompt:
@@ -54,8 +74,18 @@ def main() -> None:
             label=True,
             state=state,
         )
+    elif args.point_prompt:
+        text_outputs = model.backbone.forward_text(["visual"], device=processor.device)
+        state["backbone_out"].update(text_outputs)
+        state["geometric_prompt"] = model._get_dummy_prompt()
+        points = torch.tensor(
+            args.point_prompt, device=processor.device, dtype=torch.float32
+        ).view(-1, 1, 2)
+        labels = torch.ones(len(points), 1, device=processor.device, dtype=torch.long)
+        state["geometric_prompt"].append_points(points, labels)
+        output = processor._forward_grounding(state)
     else:
-        logger.error("either text_prompt or box_prompt must be provided")
+        logger.error("either text, box, or point prompt must be provided")
         sys.exit(1)
 
     masks, boxes, scores = output["masks"], output["boxes"], output["scores"]

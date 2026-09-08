@@ -15,6 +15,9 @@ from torchvision.transforms import v2
 
 from infer_onnx import postprocess_decoder_output
 from infer_torch import get_replace_freqs_cis
+from sam3.model.sam1_task_predictor import (  # type: ignore[unresolved-import]
+    SAM3InteractiveImagePredictor,
+)
 from sam3.model.sam3_image import Sam3Image  # type: ignore[unresolved-import]
 from sam3.model.sam3_image_processor import (  # type: ignore[unresolved-import]
     Sam3Processor,
@@ -40,17 +43,41 @@ class _ImageEncoder(torch.nn.Module):
         image = self._transform(image).unsqueeze(0)
 
         backbone_out = self._processor.model.backbone._forward_image_no_act_ckpt(image)
-        del backbone_out["vision_features"]
-        del backbone_out["sam2_backbone_out"]
 
         assert len(backbone_out["vision_pos_enc"]) == 3
         assert len(backbone_out["backbone_fpn"]) == 3
-        return *backbone_out["vision_pos_enc"], *backbone_out["backbone_fpn"]
+
+        predictor = self._processor.model.inst_interactive_predictor
+        sam2_backbone_out = backbone_out["sam2_backbone_out"]
+        sam2_backbone_out["backbone_fpn"][0] = predictor.model.sam_mask_decoder.conv_s0(
+            sam2_backbone_out["backbone_fpn"][0]
+        )
+        sam2_backbone_out["backbone_fpn"][1] = predictor.model.sam_mask_decoder.conv_s1(
+            sam2_backbone_out["backbone_fpn"][1]
+        )
+        _, vision_feats, _, _ = predictor.model._prepare_backbone_features(
+            sam2_backbone_out
+        )
+        vision_feats[-1] = vision_feats[-1] + predictor.model.no_mem_embed
+        feats = [
+            feat.permute(1, 2, 0).view(1, -1, *feat_size)
+            for feat, feat_size in zip(
+                vision_feats[::-1], predictor._bb_feat_sizes[::-1]
+            )
+        ][::-1]
+
+        return (
+            *backbone_out["vision_pos_enc"],
+            *backbone_out["backbone_fpn"],
+            feats[0],
+            feats[1],
+            feats[2],
+        )
 
 
 def _export_image_encoder(
     processor: Sam3Processor, image: PIL.Image.Image
-) -> tuple[list[NDArray], list[NDArray]]:
+) -> tuple[list[NDArray], list[NDArray], list[NDArray]]:
     image = image.resize((1008, 1008), resample=PIL.Image.BILINEAR)
 
     onnx_file: pathlib.Path = pathlib.Path("models/sam3_image_encoder.onnx")
@@ -76,6 +103,9 @@ def _export_image_encoder(
                 "backbone_fpn_0",
                 "backbone_fpn_1",
                 "backbone_fpn_2",
+                "high_res_feat_0",
+                "high_res_feat_1",
+                "image_embed",
             ],
             opset_version=21,
             verify=True,
@@ -89,8 +119,9 @@ def _export_image_encoder(
     logger.debug("finished onnx runtime inference")
 
     vision_pos_enc: list[NDArray] = output[:3]
-    backbone_fpn: list[NDArray] = output[3:]
-    return vision_pos_enc, backbone_fpn
+    backbone_fpn: list[NDArray] = output[3:6]
+    interactive_feats: list[NDArray] = output[6:]
+    return vision_pos_enc, backbone_fpn, interactive_feats
 
 
 class _LanguageEncoder(torch.nn.Module):
@@ -170,11 +201,17 @@ class _Decoder(torch.nn.Module):
         box_coords: torch.Tensor,
         box_labels: torch.Tensor,
         box_masks: torch.Tensor,
+        point_coords: torch.Tensor,
+        point_labels: torch.Tensor,
+        point_masks: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         geometric_prompt = self._processor.model._get_dummy_prompt()
         geometric_prompt.box_embeddings = box_coords
         geometric_prompt.box_labels = box_labels
         geometric_prompt.box_mask = box_masks
+        geometric_prompt.point_embeddings = point_coords
+        geometric_prompt.point_labels = point_labels
+        geometric_prompt.point_mask = point_masks
         backbone_out = {
             "vision_pos_enc": [
                 vision_pos_enc_0,
@@ -234,6 +271,9 @@ def _export_decoder(
     box_coords: NDArray,
     box_labels: NDArray,
     box_masks: NDArray,
+    point_coords: NDArray,
+    point_labels: NDArray,
+    point_masks: NDArray,
 ) -> list[NDArray]:
     onnx_file: pathlib.Path = pathlib.Path("models/sam3_decoder.onnx")
     if onnx_file.exists():
@@ -257,6 +297,9 @@ def _export_decoder(
                 torch.tensor(box_coords).to("cuda"),
                 torch.tensor(box_labels).to("cuda"),
                 torch.tensor(box_masks).to("cuda"),
+                torch.tensor(point_coords).to("cuda"),
+                torch.tensor(point_labels).to("cuda"),
+                torch.tensor(point_masks).to("cuda"),
             ),
             f=onnx_file,
             input_names=[
@@ -272,8 +315,19 @@ def _export_decoder(
                 "box_coords",
                 "box_labels",
                 "box_masks",
+                "point_coords",
+                "point_labels",
+                "point_masks",
             ],
             output_names=["boxes", "scores", "masks"],
+            dynamic_axes={
+                "box_coords": {0: "num_boxes"},
+                "box_labels": {0: "num_boxes"},
+                "box_masks": {1: "num_boxes"},
+                "point_coords": {0: "num_points"},
+                "point_labels": {0: "num_points"},
+                "point_masks": {1: "num_points"},
+            },
             opset_version=21,
             dynamo=False,
             verify=True,
@@ -293,6 +347,9 @@ def _export_decoder(
             "box_coords": box_coords,
             "box_labels": box_labels,
             "box_masks": box_masks,
+            "point_coords": point_coords,
+            "point_labels": point_labels,
+            "point_masks": point_masks,
         },
     )
     assert all(isinstance(o, np.ndarray) for o in output)
@@ -302,8 +359,104 @@ def _export_decoder(
     return output
 
 
+class _InteractiveDecoder(torch.nn.Module):
+    def __init__(self, predictor: SAM3InteractiveImagePredictor) -> None:
+        super().__init__()
+        self._predictor: SAM3InteractiveImagePredictor = predictor
+
+    def forward(
+        self,
+        image_embed: torch.Tensor,
+        high_res_feat_0: torch.Tensor,
+        high_res_feat_1: torch.Tensor,
+        point_coords: torch.Tensor,
+        point_labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        model = self._predictor.model
+        coords = point_coords * model.image_size
+        sparse_embeddings, dense_embeddings = model.sam_prompt_encoder(
+            points=(coords, point_labels),
+            boxes=None,
+            masks=None,
+        )
+        low_res_masks, iou_predictions, _, _ = model.sam_mask_decoder(
+            image_embeddings=image_embed,
+            image_pe=model.sam_prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=True,
+            repeat_image=False,
+            high_res_features=[high_res_feat_0, high_res_feat_1],
+        )
+        return low_res_masks, iou_predictions
+
+
+def _export_interactive_decoder(
+    predictor: SAM3InteractiveImagePredictor,
+    image_embed: NDArray,
+    high_res_feat_0: NDArray,
+    high_res_feat_1: NDArray,
+    point_coords: NDArray,
+    point_labels: NDArray,
+) -> list[NDArray]:
+    onnx_file: pathlib.Path = pathlib.Path("models/sam3_interactive_decoder.onnx")
+    if onnx_file.exists():
+        logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
+    else:
+        logger.debug("exporting onnx model: {!r}", str(onnx_file))
+        decoder: _InteractiveDecoder = _InteractiveDecoder(predictor=predictor)
+
+        torch.onnx.export(
+            decoder,
+            args=(
+                torch.tensor(image_embed).to("cuda"),
+                torch.tensor(high_res_feat_0).to("cuda"),
+                torch.tensor(high_res_feat_1).to("cuda"),
+                torch.tensor(point_coords).to("cuda"),
+                torch.tensor(point_labels).to("cuda"),
+            ),
+            f=onnx_file,
+            input_names=[
+                "image_embed",
+                "high_res_feat_0",
+                "high_res_feat_1",
+                "point_coords",
+                "point_labels",
+            ],
+            output_names=["mask_logits", "mask_scores"],
+            dynamic_axes={
+                "point_coords": {1: "num_points"},
+                "point_labels": {1: "num_points"},
+            },
+            opset_version=21,
+            dynamo=False,
+            verify=True,
+        )
+        logger.debug("exported onnx model: {!r}", str(onnx_file))
+
+    session = onnxruntime.InferenceSession(onnx_file)
+    output = session.run(
+        None,
+        {
+            "image_embed": image_embed,
+            "high_res_feat_0": high_res_feat_0,
+            "high_res_feat_1": high_res_feat_1,
+            "point_coords": point_coords,
+            "point_labels": point_labels,
+        },
+    )
+    assert all(isinstance(o, np.ndarray) for o in output)
+    output = typing.cast(list[NDArray], output)
+    logger.debug("interactive decoder onnx runtime inference done")
+
+    return output
+
+
 def main():
-    model: Sam3Image = build_sam3_image_model()
+    model: Sam3Image = build_sam3_image_model(enable_inst_interactivity=True)
+    # Sam3TrackerPredictor.__init__ enters a process-wide bfloat16 autocast, which
+    # would bake bf16 casts into the exported graphs
+    model.inst_interactive_predictor.model.bf16_context.__exit__(None, None, None)
     get_replace_freqs_cis(model)
     processor: Sam3Processor = Sam3Processor(model)
 
@@ -313,7 +466,9 @@ def main():
     # image_encoder {{
     # state = processor.set_image(image)
 
-    vision_pos_enc, backbone_fpn = _export_image_encoder(processor, image)
+    vision_pos_enc, backbone_fpn, interactive_feats = _export_image_encoder(
+        processor, image
+    )
     # }}
 
     # language_encoder {{
@@ -324,6 +479,23 @@ def main():
     )
     # }}
 
+    # interactive_decoder {{
+    # masks, ious, low_res_masks = model.predict_inst(state, point_coords=..., ...)
+
+    _export_interactive_decoder(
+        predictor=model.inst_interactive_predictor,
+        image_embed=interactive_feats[2],
+        high_res_feat_0=interactive_feats[0],
+        high_res_feat_1=interactive_feats[1],
+        point_coords=np.array([[[0.1543, 0.6065]]], dtype=np.float32),
+        point_labels=np.array([[1]], dtype=np.int64),
+    )
+    # }}
+
+    # free the encoder model before _Decoder builds its own copy, to fit in vram
+    del processor, model
+    torch.cuda.empty_cache()
+
     # decoder {{
     # result = processor._forward_grounding(state)
     # boxes, scores, masks = result["boxes"], result["scores"], result["masks"]
@@ -331,6 +503,9 @@ def main():
     box_coords = np.array([[[0.1620, 0.4010, 0.0640, 0.0180]]], dtype=np.float32)
     box_labels = np.array([[1]], dtype=np.int64)
     box_masks = np.array([[True]], dtype=np.bool_)
+    point_coords = np.array([[[0.1543, 0.6065]]], dtype=np.float32)
+    point_labels = np.array([[1]], dtype=np.int64)
+    point_masks = np.array([[False]], dtype=np.bool_)
 
     boxes, scores, masks = _export_decoder(
         vision_pos_enc_0=vision_pos_enc[0],
@@ -345,6 +520,9 @@ def main():
         box_coords=box_coords,
         box_labels=box_labels,
         box_masks=box_masks,
+        point_coords=point_coords,
+        point_labels=point_labels,
+        point_masks=point_masks,
     )
     # }}
 
