@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-import sys
-
 import imgviz
 import numpy as np
 import PIL.Image
@@ -72,15 +70,12 @@ def main() -> None:
 
     if args.text_prompt:
         output = processor.set_text_prompt(prompt=args.text_prompt, state=state)
-    elif args.box_prompt:
+    for box in args.box_prompt or []:
         output = processor.add_geometric_prompt(
-            box=args.box_prompt,
-            label=True,
+            box=box[:4],
+            label=bool(box[4]),
             state=state,
         )
-    else:
-        logger.error("either text_prompt or box_prompt must be provided")
-        sys.exit(1)
 
     masks, boxes, scores = output["masks"], output["boxes"], output["scores"]
     logger.debug(
