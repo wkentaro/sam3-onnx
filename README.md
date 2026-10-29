@@ -74,6 +74,14 @@ UV_PROJECT_ENVIRONMENT=.venv-gpu uv run --no-dev --no-group cpu --group gpu infe
 
 The `gpu` group installs `onnxruntime-gpu` with its CUDA and cuDNN libraries, so no system CUDA install is needed. Keep it in its own environment without the dev group: onnxruntime and onnxruntime-gpu overwrite each other's files, and so do the cuDNN libraries of torch and onnxruntime-gpu.
 
+**Inference with onnx on Apple GPU and Neural Engine (macOS)**
+
+```sh
+uv run --no-dev infer_onnx.py --image images/bus.jpg --text-prompt person --device coreml
+```
+
+The first run compiles the models for CoreML and caches them in `~/.cache/sam3-onnx/coreml`.
+
 ## Pre-exported ONNX models
 
 If don't want to export yourself, download them from the [Hugging Face repo](https://huggingface.co/wkentaro/sam3-onnx-models-v0.4.0):

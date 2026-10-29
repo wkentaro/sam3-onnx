@@ -48,9 +48,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        choices=["cpu", "cuda"],
+        choices=["cpu", "cuda", "coreml"],
         default="cpu",
-        help="Device to run the models on. cuda needs the gpu dependency group.",
+        help="Device to run the models on. cuda needs the gpu dependency group, "
+        "and coreml needs macOS.",
     )
     args = parser.parse_args()
     logger.debug("input: {}", args.__dict__)
@@ -174,7 +175,7 @@ def run_point_decoder(
 def create_sessions(
     device: str, names: list[str]
 ) -> list[onnxruntime.InferenceSession]:
-    providers = ["CPUExecutionProvider"]
+    providers: list[str | tuple[str, dict[str, str]]] = ["CPUExecutionProvider"]
     sess_options = onnxruntime.SessionOptions()  # type: ignore[possibly-missing-attribute]
     if device == "cuda":
         # Loads the CUDA libraries of osam[gpu] and shares one CUDA arena across
@@ -187,6 +188,17 @@ def create_sessions(
             sys.exit(1)
         providers.insert(0, "CUDAExecutionProvider")
         sess_options.add_session_config_entry("session.use_env_allocators", "1")
+    elif device == "coreml":
+        available = onnxruntime.get_available_providers()  # type: ignore[possibly-missing-attribute]
+        if "CoreMLExecutionProvider" not in available:
+            logger.error("CoreML is unavailable, it needs onnxruntime on macOS")
+            sys.exit(1)
+        # MLProgram supports more operators than the default NeuralNetwork format,
+        # and the cache saves compiling the models again on later runs.
+        cache_dir = pathlib.Path.home() / ".cache/sam3-onnx/coreml"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        options = {"ModelFormat": "MLProgram", "ModelCacheDirectory": str(cache_dir)}
+        providers.insert(0, ("CoreMLExecutionProvider", options))
     return [
         onnxruntime.InferenceSession(
             f"models/sam3_{name}.onnx", sess_options, providers=providers
