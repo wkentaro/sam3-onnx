@@ -182,7 +182,7 @@ def main():
         captions=[f"{text_prompt}: {s:.0%}" for s in scores],
         font_size=max(1, min(image.size) // 40),
     )
-    imgviz.io.pil_imshow(viz)
+    imgviz.io.imshow(viz)
 
 
 if __name__ == "__main__":

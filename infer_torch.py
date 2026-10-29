@@ -72,7 +72,7 @@ def main() -> None:
         labels=np.arange(len(masks)) + 1,
         captions=[f"{text_prompt}: {s:.0%}" for s in scores],
     )
-    imgviz.io.pil_imshow(viz)
+    imgviz.io.imshow(viz)
 
 
 if __name__ == "__main__":

@@ -362,7 +362,7 @@ def main():
         labels=np.arange(len(boxes)) + 1,
         captions=[f"{s:.2f}" for s in scores],
     )
-    imgviz.io.pil_imshow(viz)
+    imgviz.io.imshow(viz)
 
 
 if __name__ == "__main__":
