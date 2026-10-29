@@ -174,8 +174,9 @@ def postprocess(onnx_file: pathlib.Path) -> None:
 
     # Raises for models over protobuf's 2 GB, which would need external data.
     onnx.save(model, onnx_file)
-    for data_file in data_files:
-        (onnx_file.parent / data_file).unlink()
+    # Only the file torch writes for this model; others may be shared.
+    if f"{onnx_file.name}.data" in data_files:
+        (onnx_file.parent / f"{onnx_file.name}.data").unlink()
     logger.debug("postprocessed onnx model: {!r}", str(onnx_file))
 
 
