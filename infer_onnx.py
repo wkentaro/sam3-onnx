@@ -13,6 +13,7 @@ import PIL.Image
 from loguru import logger
 from numpy.typing import NDArray
 from osam._models.yoloworld.clip import tokenize
+from osam.types._model import _setup_cuda
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +38,12 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         const="0,0,0,0",
         help="Box prompt for segmentation in format: cx cy w h (normalized).",
+    )
+    parser.add_argument(
+        "--device",
+        choices=["cpu", "cuda"],
+        default="cpu",
+        help="Device to run the models on. cuda needs the gpu dependency group.",
     )
     args = parser.parse_args()
     logger.debug("input: {}", args.__dict__)
@@ -98,12 +105,33 @@ def postprocess_decoder_output(
     return boxes, masks
 
 
+def create_sessions(device: str) -> list[onnxruntime.InferenceSession]:
+    providers = ["CPUExecutionProvider"]
+    sess_options = onnxruntime.SessionOptions()  # type: ignore[possibly-missing-attribute]
+    if device == "cuda":
+        # Loads the CUDA libraries of osam[gpu] and shares one CUDA arena across
+        # sessions, without which the three sessions OOM on a 12 GB GPU.
+        if not _setup_cuda():
+            logger.error(
+                "CUDA is unavailable, run with: UV_PROJECT_ENVIRONMENT=.venv-gpu "
+                "uv run --no-dev --no-group cpu --group gpu infer_onnx.py ..."
+            )
+            sys.exit(1)
+        providers.insert(0, "CUDAExecutionProvider")
+        sess_options.add_session_config_entry("session.use_env_allocators", "1")
+    return [
+        onnxruntime.InferenceSession(
+            f"models/sam3_{name}.onnx", sess_options, providers=providers
+        )
+        for name in ["image_encoder", "language_encoder", "decoder"]
+    ]
+
+
 def main():
     args = parse_args()
 
-    sess_image = onnxruntime.InferenceSession("models/sam3_image_encoder.onnx")
-    sess_language = onnxruntime.InferenceSession("models/sam3_language_encoder.onnx")
-    sess_decode = onnxruntime.InferenceSession("models/sam3_decoder.onnx")
+    sess_image, sess_language, sess_decode = create_sessions(device=args.device)
+    logger.debug("providers: {}", sess_image.get_providers())
 
     image: PIL.Image.Image = PIL.Image.open(args.image).convert("RGB")
     logger.debug("original image size: {}", image.size)

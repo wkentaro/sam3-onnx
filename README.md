@@ -57,6 +57,14 @@ uv run infer_torch.py --image images/bus.jpg --box-prompt 0.548,0.658,0.043,0.09
 uv run infer_torch.py --image images/bus.jpg --box-prompt  # opens a gui to select box
 ```
 
+**Inference with onnx on GPU**
+
+```sh
+UV_PROJECT_ENVIRONMENT=.venv-gpu uv run --no-dev --no-group cpu --group gpu infer_onnx.py --image images/bus.jpg --text-prompt person --device cuda
+```
+
+The `gpu` group installs `onnxruntime-gpu` with its CUDA and cuDNN libraries, so no system CUDA install is needed. Keep it in its own environment without the dev group: onnxruntime and onnxruntime-gpu overwrite each other's files, and so do the cuDNN libraries of torch and onnxruntime-gpu.
+
 ## Pre-exported ONNX models
 
 If don't want to export yourself, download them from the [Hugging Face repo](https://huggingface.co/wkentaro/sam3-onnx-models-v0.3.0):
