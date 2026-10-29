@@ -67,8 +67,10 @@ def postprocess(onnx_file: pathlib.Path) -> None:
             initializers.get(node.input[1]) if node.op_type == "MatMul" else None
         )
         (add, *others) = consumers.get(node.output[0], [None])
+        # Only float, as onnxruntime has no integer Gemm.
         if (
             weight is not None
+            and weight.data_type == onnx.TensorProto.FLOAT
             and add is not None
             and add.op_type == "Add"
             and not others
@@ -142,12 +144,17 @@ def postprocess(onnx_file: pathlib.Path) -> None:
             or {node.output[0], transpose.output[0]} & outputs
         ):
             continue
-        perm = next(a for a in transpose.attribute if a.name == "perm")
-        if perm.ints[0] != 0 or any(
-            c.op_type != "Reshape"
-            or c.input[1] not in constants
-            or 0 in constants[c.input[1]]
-            for c in consumers.get(transpose.output[0], [])
+        # Without perm, Transpose reverses the axes and so moves axis 0.
+        perm = next((a for a in transpose.attribute if a.name == "perm"), None)
+        if (
+            perm is None
+            or perm.ints[0] != 0
+            or any(
+                c.op_type != "Reshape"
+                or c.input[1] not in constants
+                or 0 in constants[c.input[1]]
+                for c in consumers.get(transpose.output[0], [])
+            )
         ):
             continue
         node.input[1] = add_constant(f"{node.output[0]}_shape", shape[1:])
