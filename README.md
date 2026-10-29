@@ -45,6 +45,9 @@ uv run infer_torch.py --image images/bus.jpg --point-prompt 0.18,0.55
 # create models/*.onnx
 uv run export_onnx.py
 
+# or convert models from an older export in place, as export_onnx.py does
+uv run postprocess_onnx.py models/*.onnx
+
 # upload to Hugging Face Hub
 # uvx hf upload wkentaro/sam3-onnx-models-v0.3.0 models/ --include '*.onnx*'
 ```

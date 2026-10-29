@@ -19,6 +19,7 @@ from infer_onnx import postprocess_decoder_output
 from infer_onnx import postprocess_point_decoder_output
 from infer_onnx import run_point_decoder
 from infer_torch import get_replace_freqs_cis
+from postprocess_onnx import postprocess
 from sam3.model.sam3_image import Sam3Image  # type: ignore[unresolved-import]
 from sam3.model.sam3_image_processor import (  # type: ignore[unresolved-import]
     Sam3Processor,
@@ -104,6 +105,7 @@ def _export_image_encoder(
             verify=True,
         )
         logger.debug("exported onnx model: {!r}", str(onnx_file))
+        postprocess(onnx_file)
 
     session: onnxruntime.InferenceSession = onnxruntime.InferenceSession(onnx_file)
     output = session.run(None, {"image": np.asarray(image).transpose(2, 0, 1)})
@@ -164,6 +166,7 @@ def _export_language_encoder(processor: Sam3Processor) -> list[NDArray]:
             verify=True,
         )
         logger.debug("exported onnx model: {!r}", str(onnx_file))
+        postprocess(onnx_file)
 
     session: onnxruntime.InferenceSession = onnxruntime.InferenceSession(onnx_file)
     output = session.run(None, {"tokens": tokens})
@@ -303,6 +306,7 @@ def _export_decoder(
             verify=True,
         )
         logger.debug("exported onnx model: {!r}", str(onnx_file))
+        postprocess(onnx_file)
 
     session = onnxruntime.InferenceSession(onnx_file)
     output = session.run(
@@ -399,6 +403,7 @@ def _export_point_decoder(
             verify=True,
         )
         logger.debug("exported onnx model: {!r}", str(onnx_file))
+        postprocess(onnx_file)
 
     return onnxruntime.InferenceSession(onnx_file)
 
