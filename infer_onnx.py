@@ -26,20 +26,22 @@ def parse_args() -> argparse.Namespace:
         help="Path to the input image.",
         required=True,
     )
-    prompt_group = parser.add_mutually_exclusive_group(required=True)
-    prompt_group.add_argument(
+    parser.add_argument(
         "--text-prompt",
         type=str,
         help="Text prompt for segmentation.",
     )
-    prompt_group.add_argument(
+    parser.add_argument(
         "--box-prompt",
         type=str,
+        action="append",
         nargs="?",
         const="0,0,0,0",
-        help="Box prompt for segmentation in format: cx cy w h (normalized).",
+        help="Box prompt of an example object in format: cx,cy,w,h[,label] "
+        "(normalized, label 1 for positive and 0 for negative). Repeatable, and "
+        "combinable with --text-prompt.",
     )
-    prompt_group.add_argument(
+    parser.add_argument(
         "--point-prompt",
         type=str,
         action="append",
@@ -56,11 +58,17 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     logger.debug("input: {}", args.__dict__)
 
+    if args.point_prompt and (args.text_prompt or args.box_prompt):
+        parser.error("--point-prompt can't be combined with other prompts")
+    if not (args.text_prompt or args.box_prompt or args.point_prompt):
+        parser.error("one of --text-prompt, --box-prompt, --point-prompt is required")
+
     if args.box_prompt:
-        args.box_prompt = [float(x) for x in args.box_prompt.split(",")]
-        if len(args.box_prompt) != 4:
-            logger.error("box_prompt must have 4 values: cx, cy, w, h")
+        boxes = [[float(x) for x in b.split(",")] for b in args.box_prompt]
+        if any(len(b) not in (4, 5) for b in boxes):
+            logger.error("box_prompt must have 4 or 5 values: cx, cy, w, h[, label]")
             sys.exit(1)
+        args.box_prompt = [b if len(b) == 5 else [*b, 1] for b in boxes]
 
     if args.point_prompt:
         points = [[float(x) for x in p.split(",")] for p in args.point_prompt]
@@ -69,7 +77,7 @@ def parse_args() -> argparse.Namespace:
             sys.exit(1)
         args.point_prompt = [p if len(p) == 3 else [*p, 1] for p in points]
 
-    if args.box_prompt == [0, 0, 0, 0]:
+    if args.box_prompt == [[0, 0, 0, 0, 1]]:
         image: NDArray[np.uint8] = imgviz.asrgb(imgviz.io.imread(args.image))
 
         logger.info("please select box prompt in the image window")
@@ -84,13 +92,14 @@ def parse_args() -> argparse.Namespace:
             logger.warning("no box prompt selected, exiting")
             sys.exit(1)
 
-        args.box_prompt = [
+        box = [
             (x + w / 2) / image.shape[1],
             (y + h / 2) / image.shape[0],
             w / image.shape[1],
             h / image.shape[0],
         ]
-        logger.debug("box_prompt: {!r}", ",".join(f"{x:.3f}" for x in args.box_prompt))
+        logger.debug("box_prompt: {!r}", ",".join(f"{x:.3f}" for x in box))
+        args.box_prompt = [[*box, 1]]
 
     return args
 
@@ -297,13 +306,20 @@ def main():
     logger.debug("finished running language encoder")
 
     logger.debug("running decoder...")
-    box_coords: NDArray[np.float32] = np.array(
-        args.box_prompt if args.box_prompt else [0, 0, 0, 0], dtype=np.float32
-    ).reshape(1, 1, 4)
-    box_labels: NDArray[np.int64] = np.array([[1]], dtype=np.int64)
-    box_masks: NDArray[np.bool_] = np.array(
-        [False] if args.box_prompt else [True], dtype=np.bool_
-    ).reshape(1, 1)
+    # The decoder takes a fixed number of boxes, and masks out the unused ones.
+    box_prompt: list[list[float]] = args.box_prompt or []
+    (box_input,) = [i for i in sess_decode.get_inputs() if i.name == "box_coords"]
+    max_boxes: int = box_input.shape[0]
+    if len(box_prompt) > max_boxes:
+        logger.error("box_prompt must have at most {} boxes", max_boxes)
+        sys.exit(1)
+    box_coords: NDArray[np.float32] = np.zeros((max_boxes, 1, 4), dtype=np.float32)
+    box_labels: NDArray[np.int64] = np.ones((max_boxes, 1), dtype=np.int64)
+    box_masks: NDArray[np.bool_] = np.ones((1, max_boxes), dtype=np.bool_)
+    for i, box in enumerate(box_prompt):
+        box_coords[i, 0] = box[:4]
+        box_labels[i, 0] = box[4]
+        box_masks[0, i] = False
     output = sess_decode.run(
         None,
         {

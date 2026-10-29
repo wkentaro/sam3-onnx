@@ -27,6 +27,9 @@ from sam3.model.sam3_image_processor import (  # type: ignore[unresolved-import]
 from sam3.model_builder import build_sam3_image_model  # type: ignore[unresolved-import]
 
 
+MAX_BOXES: int = 16
+
+
 class _ImageEncoder(torch.nn.Module):
     def __init__(self, processor: Sam3Processor) -> None:
         super().__init__()
@@ -269,7 +272,12 @@ def _export_decoder(
     box_masks: NDArray,
 ) -> list[NDArray]:
     onnx_file: pathlib.Path = pathlib.Path("models/sam3_decoder.onnx")
-    if onnx_file.exists():
+    # v0.4.0 and earlier decoders take one box.
+    if onnx_file.exists() and [
+        i.type.tensor_type.shape.dim[0].dim_value
+        for i in onnx.load(onnx_file, load_external_data=False).graph.input
+        if i.name == "box_coords"
+    ] == [len(box_coords)]:
         logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
     else:
         logger.debug("exporting onnx model: {!r}", str(onnx_file))
@@ -445,9 +453,11 @@ def main():
     # result = processor._forward_grounding(state)
     # boxes, scores, masks = result["boxes"], result["scores"], result["masks"]
 
-    box_coords = np.array([[[0.1620, 0.4010, 0.0640, 0.0180]]], dtype=np.float32)
-    box_labels = np.array([[1]], dtype=np.int64)
-    box_masks = np.array([[True]], dtype=np.bool_)
+    # A fixed number of box slots, as tracing bakes the box count into the model.
+    # Unused slots are masked out as padding, which SAM3 batches the same way.
+    box_coords = np.zeros((MAX_BOXES, 1, 4), dtype=np.float32)
+    box_labels = np.ones((MAX_BOXES, 1), dtype=np.int64)
+    box_masks = np.ones((1, MAX_BOXES), dtype=np.bool_)
 
     boxes, scores, masks = _export_decoder(
         vision_pos_enc_0=vision_pos_enc[0],
