@@ -5,10 +5,15 @@ requires-python = ">=3.13"
 dependencies = [
     "imgviz>=1.7.6",
     "loguru>=0.7.3",
-    "onnxruntime>=1.23.2",
     "opencv-python>=4.11.0.86",
-    "osam>=0.2.5",
+    "osam",
 ]
+
+[tool.uv]
+default-groups = ["dev", "cpu"]
+# onnxruntime and onnxruntime-gpu install into the same package directory, and
+# so do the cuDNN wheels of torch (CUDA 12) and onnxruntime-gpu (CUDA 13).
+conflicts = [[{ group = "cpu" }, { group = "gpu" }], [{ group = "gpu" }, { group = "dev" }]]
 
 [tool.uv.workspace]
 members = [
@@ -46,6 +51,8 @@ force-single-line = true
 src.exclude = ["sam3/"]
 
 [dependency-groups]
+cpu = ["osam[cpu]"]
+gpu = ["osam[gpu]"]
 dev = [
     "ipython>=9.8.0",
     "onnxscript>=0.5.6",
@@ -56,3 +63,4 @@ dev = [
 
 [tool.uv.sources]
 sam3 = { workspace = true, editable = true }
+osam = { git = "https://github.com/wkentaro/osam", rev = "c45c9968d86532b1d722cd6fbf6d6d9d2f934972" }

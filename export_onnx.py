@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 
+import copy
 import pathlib
 import typing
 
 import imgviz
 import numpy as np
+import onnx
 import onnxruntime
 import PIL.Image
 import torch
@@ -14,7 +16,10 @@ from osam._models.yoloworld.clip import tokenize
 from torchvision.transforms import v2
 
 from infer_onnx import postprocess_decoder_output
+from infer_onnx import postprocess_point_decoder_output
+from infer_onnx import run_point_decoder
 from infer_torch import get_replace_freqs_cis
+from postprocess_onnx import postprocess
 from sam3.model.sam3_image import Sam3Image  # type: ignore[unresolved-import]
 from sam3.model.sam3_image_processor import (  # type: ignore[unresolved-import]
     Sam3Processor,
@@ -41,20 +46,42 @@ class _ImageEncoder(torch.nn.Module):
 
         backbone_out = self._processor.model.backbone._forward_image_no_act_ckpt(image)
         del backbone_out["vision_features"]
-        del backbone_out["sam2_backbone_out"]
+
+        # Features for the point and mask decoder, as in Sam3Processor.set_image
+        # and Sam3Image.predict_inst.
+        sam2_fpn = backbone_out.pop("sam2_backbone_out")["backbone_fpn"]
+        tracker = self._processor.model.inst_interactive_predictor.model
+        high_res_features1 = tracker.sam_mask_decoder.conv_s0(sam2_fpn[0])
+        high_res_features2 = tracker.sam_mask_decoder.conv_s1(sam2_fpn[1])
+        image_embeddings = sam2_fpn[2] + tracker.no_mem_embed.view(1, -1, 1, 1)
 
         assert len(backbone_out["vision_pos_enc"]) == 3
         assert len(backbone_out["backbone_fpn"]) == 3
-        return *backbone_out["vision_pos_enc"], *backbone_out["backbone_fpn"]
+        return (
+            *backbone_out["vision_pos_enc"],
+            *backbone_out["backbone_fpn"],
+            image_embeddings,
+            high_res_features1,
+            high_res_features2,
+        )
+
+
+def _postprocess(onnx_file: pathlib.Path) -> None:
+    postprocess(onnx_file)
+    # torch writes this file for this model alone, and nothing reads it now.
+    (onnx_file.parent / f"{onnx_file.name}.data").unlink(missing_ok=True)
 
 
 def _export_image_encoder(
     processor: Sam3Processor, image: PIL.Image.Image
-) -> tuple[list[NDArray], list[NDArray]]:
+) -> tuple[list[NDArray], list[NDArray], list[NDArray]]:
     image = image.resize((1008, 1008), resample=PIL.Image.BILINEAR)
 
     onnx_file: pathlib.Path = pathlib.Path("models/sam3_image_encoder.onnx")
-    if onnx_file.exists():
+    # v0.3.0 and earlier encoders lack the outputs of the point decoder.
+    if onnx_file.exists() and "image_embeddings" in [
+        o.name for o in onnx.load(onnx_file, load_external_data=False).graph.output
+    ]:
         logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
     else:
         encoder: _ImageEncoder = _ImageEncoder(processor=processor)
@@ -76,11 +103,15 @@ def _export_image_encoder(
                 "backbone_fpn_0",
                 "backbone_fpn_1",
                 "backbone_fpn_2",
+                "image_embeddings",
+                "high_res_features1",
+                "high_res_features2",
             ],
             opset_version=21,
             verify=True,
         )
         logger.debug("exported onnx model: {!r}", str(onnx_file))
+        _postprocess(onnx_file)
 
     session: onnxruntime.InferenceSession = onnxruntime.InferenceSession(onnx_file)
     output = session.run(None, {"image": np.asarray(image).transpose(2, 0, 1)})
@@ -89,8 +120,9 @@ def _export_image_encoder(
     logger.debug("finished onnx runtime inference")
 
     vision_pos_enc: list[NDArray] = output[:3]
-    backbone_fpn: list[NDArray] = output[3:]
-    return vision_pos_enc, backbone_fpn
+    backbone_fpn: list[NDArray] = output[3:6]
+    sam2_features: list[NDArray] = output[6:]
+    return vision_pos_enc, backbone_fpn, sam2_features
 
 
 class _LanguageEncoder(torch.nn.Module):
@@ -140,6 +172,7 @@ def _export_language_encoder(processor: Sam3Processor) -> list[NDArray]:
             verify=True,
         )
         logger.debug("exported onnx model: {!r}", str(onnx_file))
+        _postprocess(onnx_file)
 
     session: onnxruntime.InferenceSession = onnxruntime.InferenceSession(onnx_file)
     output = session.run(None, {"tokens": tokens})
@@ -279,6 +312,7 @@ def _export_decoder(
             verify=True,
         )
         logger.debug("exported onnx model: {!r}", str(onnx_file))
+        _postprocess(onnx_file)
 
     session = onnxruntime.InferenceSession(onnx_file)
     output = session.run(
@@ -302,8 +336,89 @@ def _export_decoder(
     return output
 
 
+class _PointDecoder(torch.nn.Module):
+    def __init__(self, model: Sam3Image) -> None:
+        super().__init__()
+        tracker = model.inst_interactive_predictor.model
+        # On CUDA, tracing torch.repeat_interleave in the mask decoder puts its
+        # index on the CPU, so export this small decoder on the CPU.
+        self._prompt_encoder = copy.deepcopy(tracker.sam_prompt_encoder).cpu()
+        self._mask_decoder = copy.deepcopy(tracker.sam_mask_decoder).cpu()
+
+    def forward(
+        self,
+        image_embeddings: torch.Tensor,
+        high_res_features1: torch.Tensor,
+        high_res_features2: torch.Tensor,
+        point_coords: torch.Tensor,
+        point_labels: torch.Tensor,
+        mask_input: torch.Tensor,
+        has_mask_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # SAM3InteractiveImagePredictor._predict with multimask_output=True
+        prompt_encoder = self._prompt_encoder
+        sparse_embeddings, dense_embeddings = prompt_encoder(
+            points=(point_coords, point_labels), boxes=None, masks=None
+        )
+        dense_embeddings = (
+            has_mask_input * prompt_encoder._embed_masks(mask_input)
+            + (1 - has_mask_input) * dense_embeddings
+        )
+        low_res_masks, iou_predictions, _, _ = self._mask_decoder(
+            image_embeddings=image_embeddings,
+            image_pe=prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=True,
+            repeat_image=False,
+            high_res_features=[high_res_features1, high_res_features2],
+        )
+        # As SAM3InteractiveImagePredictor._predict, so they can be fed back.
+        return iou_predictions, low_res_masks.clamp(-32.0, 32.0)
+
+
+def _export_point_decoder(
+    model: Sam3Image, sam2_features: list[NDArray]
+) -> onnxruntime.InferenceSession:
+    onnx_file: pathlib.Path = pathlib.Path("models/sam3_point_decoder.onnx")
+    if onnx_file.exists():
+        logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
+    else:
+        inputs: dict[str, NDArray] = {
+            "image_embeddings": sam2_features[0],
+            "high_res_features1": sam2_features[1],
+            "high_res_features2": sam2_features[2],
+            "point_coords": np.full((1, 1, 2), 504, dtype=np.float32),
+            "point_labels": np.ones((1, 1), dtype=np.float32),
+            "mask_input": np.zeros((1, 1, 288, 288), dtype=np.float32),
+            "has_mask_input": np.array([0], dtype=np.float32),
+        }
+        logger.debug("exporting onnx model: {!r}", str(onnx_file))
+        torch.onnx.export(
+            _PointDecoder(model=model),
+            args=tuple(torch.tensor(v) for v in inputs.values()),
+            f=onnx_file,
+            input_names=list(inputs),
+            output_names=["iou_predictions", "low_res_masks"],
+            dynamic_axes={
+                "point_coords": {1: "num_points"},
+                "point_labels": {1: "num_points"},
+            },
+            opset_version=21,
+            dynamo=False,
+            verify=True,
+        )
+        logger.debug("exported onnx model: {!r}", str(onnx_file))
+        _postprocess(onnx_file)
+
+    return onnxruntime.InferenceSession(onnx_file)
+
+
 def main():
-    model: Sam3Image = build_sam3_image_model()
+    model: Sam3Image = build_sam3_image_model(enable_inst_interactivity=True)
+    # The tracker enters bfloat16 autocast for the whole process on construction,
+    # which puts bfloat16 Convs into the exported model.
+    model.inst_interactive_predictor.model.bf16_context.__exit__(None, None, None)
     get_replace_freqs_cis(model)
     processor: Sam3Processor = Sam3Processor(model)
 
@@ -313,7 +428,9 @@ def main():
     # image_encoder {{
     # state = processor.set_image(image)
 
-    vision_pos_enc, backbone_fpn = _export_image_encoder(processor, image)
+    vision_pos_enc, backbone_fpn, sam2_features = _export_image_encoder(
+        processor, image
+    )
     # }}
 
     # language_encoder {{
@@ -362,7 +479,48 @@ def main():
         labels=np.arange(len(boxes)) + 1,
         captions=[f"{s:.2f}" for s in scores],
     )
-    imgviz.io.pil_imshow(viz)
+
+    # point_decoder {{
+    # state = processor.set_image(image)
+    # model.predict_inst(state, point_coords=..., point_labels=..., mask_input=...)
+
+    best_box: NDArray = boxes[scores.argmax()]
+    point: NDArray = (best_box[:2] + best_box[2:]) / 2
+    iou_predictions, low_res_masks = run_point_decoder(
+        sess_point_decode=_export_point_decoder(model, sam2_features),
+        sam2_features=sam2_features,
+        point_prompt=[[point[0] / image.width, point[1] / image.height, 1]],
+    )
+    # }}
+
+    state = processor.set_image(image)
+    kwargs = dict(
+        point_coords=point[None], point_labels=np.array([1]), multimask_output=True
+    )
+    _, iou_torch, low_res_torch = model.predict_inst(state, **kwargs)
+    _, iou_torch, low_res_torch = model.predict_inst(
+        state, mask_input=low_res_torch[[iou_torch.argmax()]], **kwargs
+    )
+    logger.debug(
+        "point decoder vs pytorch: iou_predictions {} vs {}, mask agreement {:.3f}",
+        iou_predictions[0].round(3),
+        iou_torch.round(3),
+        ((low_res_masks[0] > 0) == (low_res_torch > 0)).mean(),
+    )
+
+    mask, score = postprocess_point_decoder_output(
+        iou_predictions=iou_predictions,
+        low_res_masks=low_res_masks,
+        image_width=image.width,
+        image_height=image.height,
+    )
+    viz_point = imgviz.instances2rgb(
+        image=np.asarray(image),
+        masks=mask[None],
+        labels=[1],
+        captions=[f"{score:.2f}"],
+    )
+    imgviz.io.imshow(imgviz.tile([viz, viz_point], row=1, col=2))
 
 
 if __name__ == "__main__":
