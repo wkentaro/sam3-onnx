@@ -90,6 +90,16 @@ uv run --no-dev infer_onnx.py --image images/bus.jpg --text-prompt person --devi
 
 The image encoder runs on the GPU through CoreML, about 5x faster than on CPU (3 s against 15 s on an M5). The other models stay on CPU, where they take under 2 s.
 
+**Check text-prompt scores against PyTorch on CPU**
+
+Save the apple image from [issue #2](https://github.com/wkentaro/sam3-onnx/issues/2), then run:
+
+```sh
+uv run test_text_parity.py --apple-image /path/to/apple.jpg
+```
+
+The check compares preprocessing, image and language features, and decoder scores for apples and `images/bus.jpg` with "person". It also feeds PyTorch features to the ONNX decoder to isolate decoder errors. Both pipelines must return the same detection count and sorted scores within 0.01. PIL bilinear resizing can differ from PyTorch's tensor resize by one uint8 level. This inference fix works with the existing models; no re-export or Hugging Face upload is needed.
+
 ## Pre-exported ONNX models
 
 If don't want to export yourself, download them from the [Hugging Face repo](https://huggingface.co/wkentaro/sam3-onnx-models-v0.5.0):

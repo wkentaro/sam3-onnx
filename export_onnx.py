@@ -17,6 +17,7 @@ from torchvision.transforms import v2
 
 from infer_onnx import postprocess_decoder_output
 from infer_onnx import postprocess_point_decoder_output
+from infer_onnx import preprocess_image
 from infer_onnx import run_point_decoder
 from infer_torch import get_replace_freqs_cis
 from postprocess_onnx import postprocess
@@ -78,7 +79,7 @@ def _postprocess(onnx_file: pathlib.Path) -> None:
 def _export_image_encoder(
     processor: Sam3Processor, image: PIL.Image.Image
 ) -> tuple[list[NDArray], list[NDArray], list[NDArray]]:
-    image = image.resize((1008, 1008), resample=PIL.Image.BILINEAR)
+    pixels = preprocess_image(image)
 
     onnx_file: pathlib.Path = pathlib.Path("models/sam3_image_encoder.onnx")
     # v0.3.0 and earlier encoders lack the outputs of the point decoder.
@@ -88,7 +89,7 @@ def _export_image_encoder(
         logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
     else:
         encoder: _ImageEncoder = _ImageEncoder(processor=processor)
-        input_image: torch.Tensor = v2.functional.to_image(image).to("cuda")
+        input_image: torch.Tensor = torch.from_numpy(pixels.copy()).to("cuda")
 
         # with torch.no_grad():
         #     output = image_backbone(input_image)
@@ -117,7 +118,7 @@ def _export_image_encoder(
         _postprocess(onnx_file)
 
     session: onnxruntime.InferenceSession = onnxruntime.InferenceSession(onnx_file)
-    output = session.run(None, {"image": np.asarray(image).transpose(2, 0, 1)})
+    output = session.run(None, {"image": pixels})
     assert all(isinstance(o, np.ndarray) for o in output)
     output = typing.cast(list[NDArray], output)
     logger.debug("finished onnx runtime inference")
