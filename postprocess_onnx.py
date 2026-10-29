@@ -136,14 +136,23 @@ def postprocess(onnx_file: pathlib.Path) -> None:
         shape: np.ndarray | None = (
             constants.get(node.input[1]) if node.op_type == "Reshape" else None
         )
-        if shape is None or len(shape) != 6 or shape[0] != 1:
+        # A 0 in a shape copies the input dimension at its index, which shifts.
+        if shape is None or len(shape) != 6 or shape[0] != 1 or 0 in shape:
             continue
         (transpose, *others) = consumers.get(node.output[0], [None])
-        if others or transpose is None or transpose.op_type != "Transpose":
+        if (
+            others
+            or transpose is None
+            or transpose.op_type != "Transpose"
+            or {node.output[0], transpose.output[0]} & outputs
+        ):
             continue
         perm = next(a for a in transpose.attribute if a.name == "perm")
         if perm.ints[0] != 0 or any(
-            c.op_type != "Reshape" for c in consumers.get(transpose.output[0], [])
+            c.op_type != "Reshape"
+            or c.input[1] not in constants
+            or 0 in constants[c.input[1]]
+            for c in consumers.get(transpose.output[0], [])
         ):
             continue
         node.input[1] = add_constant(f"{node.output[0]}_shape", shape[1:])

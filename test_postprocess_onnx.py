@@ -20,6 +20,7 @@ def test_postprocess() -> None:
             numpy_helper.from_array(np.array(1), "index"),
             numpy_helper.from_array(np.array([1, 4, 3, 2, 2, 5]), "shape6"),
             numpy_helper.from_array(np.array([-1, 3, 2, 5]), "shape4"),
+            numpy_helper.from_array(np.array([0, -1]), "shape_copy"),
             numpy_helper.from_array(np.ones(4096, np.float32), "weight"),
             numpy_helper.from_array(np.arange(20, dtype=np.float32).reshape(4, 5), "w"),
             numpy_helper.from_array(np.arange(5, dtype=np.float32), "b"),
@@ -34,6 +35,18 @@ def test_postprocess() -> None:
                     "Transpose", ["r"], ["t"], name="transpose", perm=[0, 1, 3, 2, 4, 5]
                 ),
                 helper.make_node("Reshape", ["t", "shape4"], ["y"], name="reshape2"),
+                # The same, but the last Reshape copies the leading 1, so it stays.
+                helper.make_node("Reshape", ["g", "shape6"], ["r0"], name="reshape0"),
+                helper.make_node(
+                    "Transpose",
+                    ["r0"],
+                    ["t0"],
+                    name="transpose0",
+                    perm=[0, 1, 3, 2, 4, 5],
+                ),
+                helper.make_node(
+                    "Reshape", ["t0", "shape_copy"], ["y0"], name="reshape_copy"
+                ),
                 helper.make_node(
                     "ReduceSum", ["weight"], ["s"], name="sum", keepdims=0
                 ),
@@ -48,6 +61,7 @@ def test_postprocess() -> None:
             ],
             [
                 helper.make_tensor_value_info("y", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("y0", TensorProto.FLOAT, None),
                 helper.make_tensor_value_info("s", TensorProto.FLOAT, None),
                 helper.make_tensor_value_info("v", TensorProto.FLOAT, None),
             ],
@@ -85,7 +99,7 @@ def test_postprocess() -> None:
                 assert node.attribute[0].name == "transB" and node.attribute[0].i == 1
             if node.op_type in ("Gather", "Reshape"):
                 assert constants[node.input[1]].ndim == 1
-            if node.op_type == "Reshape":
+            if node.op_type == "Reshape" and node.name != "reshape0":
                 assert len(constants[node.input[1]]) <= 5
 
 
