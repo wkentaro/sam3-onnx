@@ -7,7 +7,7 @@
 ```sh
 git clone https://github.com/wkentaro/sam3-onnx.git --recursive && cd sam3-onnx
 
-uvx hf download wkentaro/sam3-onnx-models-v0.3.0 --local-dir models  # download pre-exported models
+uvx hf download wkentaro/sam3-onnx-models-v0.4.0 --local-dir models  # download pre-exported models
 
 uv run --no-dev infer_onnx.py --image images/bus.jpg --text-prompt person
 uv run --no-dev infer_onnx.py --image images/sofa.jpg --text-prompt sofa
@@ -49,7 +49,7 @@ uv run export_onnx.py
 uv run postprocess_onnx.py models/*.onnx
 
 # upload to Hugging Face Hub
-# uvx hf upload wkentaro/sam3-onnx-models-v0.3.0 models/ --include '*.onnx*'
+# uvx hf upload wkentaro/sam3-onnx-models-v0.4.0 models/ --include '*.onnx'
 ```
 
 **Inference with onnx**
@@ -76,16 +76,14 @@ The `gpu` group installs `onnxruntime-gpu` with its CUDA and cuDNN libraries, so
 
 ## Pre-exported ONNX models
 
-If don't want to export yourself, download them from the [Hugging Face repo](https://huggingface.co/wkentaro/sam3-onnx-models-v0.3.0):
+If don't want to export yourself, download them from the [Hugging Face repo](https://huggingface.co/wkentaro/sam3-onnx-models-v0.4.0):
 
 ```
 models
 ├── sam3_decoder.onnx
-├── sam3_decoder.onnx.data
 ├── sam3_image_encoder.onnx
-├── sam3_image_encoder.onnx.data
 ├── sam3_language_encoder.onnx
-└── sam3_language_encoder.onnx.data
+└── sam3_point_decoder.onnx
 ```
 
 ## Examples
