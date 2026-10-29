@@ -193,11 +193,11 @@ def create_sessions(
         if "CoreMLExecutionProvider" not in available:
             logger.error("CoreML is unavailable, it needs onnxruntime on macOS")
             sys.exit(1)
-        # MLProgram supports more operators than the default NeuralNetwork format,
-        # and the cache saves compiling the models again on later runs.
-        cache_dir = pathlib.Path.home() / ".cache/sam3-onnx/coreml"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        options = {"ModelFormat": "MLProgram", "ModelCacheDirectory": str(cache_dir)}
+        # MLProgram supports more operators than the default NeuralNetwork format.
+        # ponytail: no ModelCacheDirectory, since onnxruntime keys it by model path
+        # and would reuse stale models after a re-export; key it by content if the
+        # compile time at startup hurts.
+        options = {"ModelFormat": "MLProgram"}
         providers.insert(0, ("CoreMLExecutionProvider", options))
     return [
         onnxruntime.InferenceSession(

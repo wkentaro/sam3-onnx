@@ -80,8 +80,6 @@ The `gpu` group installs `onnxruntime-gpu` with its CUDA and cuDNN libraries, so
 uv run --no-dev infer_onnx.py --image images/bus.jpg --text-prompt person --device coreml
 ```
 
-The first run compiles the models for CoreML and caches them in `~/.cache/sam3-onnx/coreml`.
-
 ## Pre-exported ONNX models
 
 If don't want to export yourself, download them from the [Hugging Face repo](https://huggingface.co/wkentaro/sam3-onnx-models-v0.4.0):
