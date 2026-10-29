@@ -7,7 +7,7 @@
 ```sh
 git clone https://github.com/wkentaro/sam3-onnx.git --recursive && cd sam3-onnx
 
-uvx hf download wkentaro/sam3-onnx-models-v0.4.0 --local-dir models  # download pre-exported models
+uvx hf download wkentaro/sam3-onnx-models-v0.5.0 --local-dir models  # download pre-exported models
 
 uv run --no-dev infer_onnx.py --image images/bus.jpg --text-prompt person
 uv run --no-dev infer_onnx.py --image images/sofa.jpg --text-prompt sofa
@@ -35,6 +35,10 @@ uv run infer_torch.py --image images/bus.jpg --text-prompt person
 uv run infer_torch.py --image images/bus.jpg --box-prompt 0.548,0.658,0.043,0.095
 uv run infer_torch.py --image images/bus.jpg --box-prompt  # opens a gui to select box
 
+# with several example boxes: cx,cy,w,h[,label] (label 0 for a negative example), also with text
+uv run infer_torch.py --image images/bus.jpg --box-prompt 0.184,0.601,0.24,0.466 --box-prompt 0.35,0.585,0.146,0.419,0
+uv run infer_torch.py --image images/bus.jpg --text-prompt person --box-prompt 0.35,0.585,0.146,0.419,0
+
 # with point prompt: x,y[,label] (normalized, label 0 for background), repeatable
 uv run infer_torch.py --image images/bus.jpg --point-prompt 0.18,0.55
 ```
@@ -49,7 +53,7 @@ uv run export_onnx.py
 uv run postprocess_onnx.py models/*.onnx && rm models/*.onnx.data
 
 # upload to Hugging Face Hub
-# uvx hf upload wkentaro/sam3-onnx-models-v0.4.0 models/ --include '*.onnx'
+# uvx hf upload wkentaro/sam3-onnx-models-v0.5.0 models/ --include '*.onnx'
 ```
 
 **Inference with onnx**
@@ -61,6 +65,10 @@ uv run infer_onnx.py --image images/bus.jpg --text-prompt person
 # with box prompt
 uv run infer_onnx.py --image images/bus.jpg --box-prompt 0.548,0.658,0.043,0.095
 uv run infer_onnx.py --image images/bus.jpg --box-prompt  # opens a gui to select box
+
+# with several example boxes: cx,cy,w,h[,label] (label 0 for a negative example), also with text
+uv run infer_onnx.py --image images/bus.jpg --box-prompt 0.184,0.601,0.24,0.466 --box-prompt 0.35,0.585,0.146,0.419,0
+uv run infer_onnx.py --image images/bus.jpg --text-prompt person --box-prompt 0.35,0.585,0.146,0.419,0
 
 # with point prompt: x,y[,label] (normalized, label 0 for background), repeatable
 uv run infer_onnx.py --image images/bus.jpg --point-prompt 0.18,0.55
@@ -84,7 +92,7 @@ The image encoder runs on the GPU through CoreML, about 5x faster than on CPU (3
 
 ## Pre-exported ONNX models
 
-If don't want to export yourself, download them from the [Hugging Face repo](https://huggingface.co/wkentaro/sam3-onnx-models-v0.4.0):
+If don't want to export yourself, download them from the [Hugging Face repo](https://huggingface.co/wkentaro/sam3-onnx-models-v0.5.0):
 
 ```
 models
