@@ -11,7 +11,8 @@ from onnx import numpy_helper
 
 
 def postprocess(onnx_file: pathlib.Path) -> None:
-    """Rewrite ops that onnxruntime's CoreML EP rejects, and inline the weights.
+    """Rewrite ops that onnxruntime's CoreML EP rejects or loads slowly, and inline
+    the weights.
 
     Every rewrite is exact, so CPU and CUDA outputs stay the same. CoreML runs a
     graph it fully supports as one partition instead of tens, and its EP cannot
@@ -24,6 +25,8 @@ def postprocess(onnx_file: pathlib.Path) -> None:
         for entry in tensor.external_data
         if entry.key == "location"
     }
+    # Before the weights load, as shape inference copies the model.
+    shapes: dict[str, list[int]] = _static_shapes(model)
     onnx.load_external_data_for_model(model, str(onnx_file.parent))
     graph: onnx.GraphProto = model.graph
 
@@ -43,6 +46,8 @@ def postprocess(onnx_file: pathlib.Path) -> None:
             and node.attribute[0].name == "value"
         ):
             constants[node.output[0]] = numpy_helper.to_array(node.attribute[0].t)
+    initializers: dict[str, onnx.TensorProto] = {t.name: t for t in graph.initializer}
+    outputs: set[str] = {o.name for o in graph.output}
     consumers: dict[str, list[onnx.NodeProto]] = {}
     for node in graph.node:
         for name in node.input:
@@ -53,9 +58,59 @@ def postprocess(onnx_file: pathlib.Path) -> None:
         return name
 
     changed: set[str] = set()
+    fused: set[str] = set()
     nodes: list[onnx.NodeProto] = []
     for node in graph.node:
+        if node.output[0] in fused:
+            continue
+
+        # MatMul(x, W) + Add(b) -> Reshape, Gemm, Reshape, as onnxruntime fuses
+        # them for static shapes, but with W already {N, K} (transB=1). Otherwise
+        # the CoreML EP writes the transposed W into the model as text, which
+        # takes Core ML minutes to load.
+        weight: onnx.TensorProto | None = (
+            initializers.get(node.input[1]) if node.op_type == "MatMul" else None
+        )
+        (add, *others) = consumers.get(node.output[0], [None])
+        if (
+            weight is not None
+            and add is not None
+            and add.op_type == "Add"
+            and not others
+            and node.output[0] not in outputs
+        ):
+            x_shape: list[int] = shapes.get(node.input[0], [])
+            bias: str = next((i for i in add.input if i != node.output[0]), "")
+            if (
+                len(weight.dims) != 2
+                or len(x_shape) < 2
+                or bias not in initializers
+                or list(initializers[bias].dims) != [weight.dims[1]]
+            ):
+                nodes.append(node)
+                continue
+            (k, n) = weight.dims
+            output = add.output[0]
+            (x_2d, y_2d) = (f"{output}_2d", f"{output}_gemm")
+            w_t = add_constant(
+                f"{output}_weight", numpy_helper.to_array(weight).T.copy()
+            )
+            shape_2d = add_constant(f"{x_2d}_shape", np.array([-1, k]))
+            shape_nd = add_constant(f"{output}_shape", np.array([*x_shape[:-1], n]))
+            nodes += [
+                helper.make_node(
+                    "Reshape", [node.input[0], shape_2d], [x_2d], name=x_2d
+                ),
+                helper.make_node(
+                    "Gemm", [x_2d, w_t, bias], [y_2d], name=y_2d, transB=1
+                ),
+                helper.make_node("Reshape", [y_2d, shape_nd], [output], name=output),
+            ]
+            fused.add(output)
+            changed.add(node.output[0])
+            continue
         nodes.append(node)
+
         indices: np.ndarray | None = (
             constants.get(node.input[1]) if node.op_type == "Gather" else None
         )
@@ -101,7 +156,7 @@ def postprocess(onnx_file: pathlib.Path) -> None:
     value_info = [v for v in graph.value_info if v.name not in changed]
     del graph.value_info[:]
     graph.value_info.extend(value_info)
-    # Drop the scalar indices and rank-6 shapes that nothing reads anymore.
+    # Drop the scalar indices, rank-6 shapes and {K, N} weights nothing reads.
     used: set[str] = {name for n in _all_nodes(graph) for name in n.input}
     used.update(o.name for o in graph.output)
     for index in reversed(range(len(graph.initializer))):
@@ -113,6 +168,18 @@ def postprocess(onnx_file: pathlib.Path) -> None:
     for data_file in data_files:
         (onnx_file.parent / data_file).unlink()
     logger.debug("postprocessed onnx model: {!r}", str(onnx_file))
+
+
+def _static_shapes(model: onnx.ModelProto) -> dict[str, list[int]]:
+    graph: onnx.GraphProto = onnx.shape_inference.infer_shapes(
+        model, data_prop=True
+    ).graph
+    shapes: dict[str, list[int]] = {}
+    for value in [*graph.input, *graph.value_info, *graph.output]:
+        dims = value.type.tensor_type.shape.dim
+        if all(d.HasField("dim_value") for d in dims):
+            shapes[value.name] = [d.dim_value for d in dims]
+    return shapes
 
 
 def _all_nodes(graph: onnx.GraphProto):
