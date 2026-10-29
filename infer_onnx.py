@@ -175,7 +175,8 @@ def run_point_decoder(
 def create_sessions(
     device: str, names: list[str]
 ) -> list[onnxruntime.InferenceSession]:
-    providers: list[str | tuple[str, dict[str, str]]] = ["CPUExecutionProvider"]
+    providers: list[str] = ["CPUExecutionProvider"]
+    coreml_options: dict[str, str] | None = None
     sess_options = onnxruntime.SessionOptions()  # type: ignore[possibly-missing-attribute]
     if device == "cuda":
         # Loads the CUDA libraries of osam[gpu] and shares one CUDA arena across
@@ -193,18 +194,36 @@ def create_sessions(
         if "CoreMLExecutionProvider" not in available:
             logger.error("CoreML is unavailable, it needs onnxruntime on macOS")
             sys.exit(1)
-        # MLProgram supports more operators than the default NeuralNetwork format.
-        # ponytail: no ModelCacheDirectory, since onnxruntime keys it by model path
-        # and would reuse stale models after a re-export; key it by content if the
-        # compile time at startup hurts.
-        options = {"ModelFormat": "MLProgram"}
-        providers.insert(0, ("CoreMLExecutionProvider", options))
-    return [
-        onnxruntime.InferenceSession(
-            f"models/sam3_{name}.onnx", sess_options, providers=providers
+        # onnxruntime's CoreML EP can't read external data.
+        if pathlib.Path("models/sam3_image_encoder.onnx.data").exists():
+            logger.error(
+                "CoreML needs models with inline weights, run: "
+                "uv run postprocess_onnx.py models/*.onnx"
+            )
+            sys.exit(1)
+        # MLProgram supports more operators than the default NeuralNetwork, and
+        # leaving out the Neural Engine keeps the GPU's accuracy and speed.
+        # ponytail: no ModelCacheDirectory, which saves 3 s of the compile but
+        # stores another 3.5 GB keyed by model path; add it for long sessions.
+        coreml_options = {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU"}
+    sessions: list[onnxruntime.InferenceSession] = []
+    for name in names:
+        # Only the image encoder: the decoders take longer to compile for CoreML
+        # than it saves them.
+        session_providers: list[str | tuple[str, dict[str, str]]] = [*providers]
+        if coreml_options is not None and name == "image_encoder":
+            session_providers.insert(0, ("CoreMLExecutionProvider", coreml_options))
+        session = onnxruntime.InferenceSession(
+            f"models/sam3_{name}.onnx", sess_options, providers=session_providers
         )
-        for name in names
-    ]
+        # onnxruntime silently falls back to CPU for a provider it can't use.
+        (provider, *_) = session_providers
+        provider = provider if isinstance(provider, str) else provider[0]
+        if provider not in session.get_providers():
+            logger.error("{} is not running on {}", name, provider)
+            sys.exit(1)
+        sessions.append(session)
+    return sessions
 
 
 def main():
