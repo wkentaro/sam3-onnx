@@ -16,9 +16,9 @@ at `opset_version=16` fails inside a convolution with "Cannot insert a Tensor
 that requires grad as a constant", so supporting it would need changes beyond
 the export call.
 
-If a runtime only accepts an older opset, convert the exported models with a
-tool such as `onnx.version_converter`, and check the outputs against the
-opset 21 models.
+Converting the exported models down with `onnx.version_converter` doesn't
+work either. Opset 16 has no `LayerNormalization`, which the models use, and
+the converter fails on `ConstantOfShape` in the point decoder.
 
 ## Prior requests
 
