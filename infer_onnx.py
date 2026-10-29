@@ -110,6 +110,13 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def preprocess_image(image: PIL.Image.Image) -> NDArray[np.uint8]:
+    # Sam3Processor uses antialiased bilinear resizing, not PIL's default bicubic.
+    return np.asarray(
+        image.resize((1008, 1008), resample=PIL.Image.Resampling.BILINEAR)
+    ).transpose(2, 0, 1)
+
+
 def postprocess_decoder_output(
     boxes: NDArray,
     masks: NDArray,
@@ -264,7 +271,7 @@ def main():
     )
     output = sess_image.run(
         output_names,
-        {"image": np.asarray(image.resize((1008, 1008))).transpose(2, 0, 1)},
+        {"image": preprocess_image(image)},
     )
     assert all(isinstance(o, np.ndarray) for o in output)
     output = typing.cast(list[NDArray], output)
