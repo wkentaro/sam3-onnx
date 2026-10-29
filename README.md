@@ -61,9 +61,9 @@ uv run postprocess_onnx.py models/*.onnx && rm models/*.onnx.data
 [SAM3-LiteText](https://github.com/SimonZeng7108/efficientsam3/tree/sam3_litetext)
 replaces the language encoder with a distilled MobileCLIP encoder. Export it on
 CPU using an upstream checkout. The released weights download automatically.
-The MobileCLIP weights fall under Apple's
-[model license](https://github.com/apple/ml-mobileclip/blob/main/LICENSE_MODELS),
-which limits them and exported encoders to non-commercial research.
+The encoders are distilled from MobileCLIP and may count as derivatives under
+Apple's [model license](https://github.com/apple/ml-mobileclip/blob/main/LICENSE_MODELS),
+which limits use to non-commercial research. Check it before commercial use.
 
 ```sh
 git clone --branch sam3_litetext https://github.com/SimonZeng7108/efficientsam3.git ../efficientsam3
