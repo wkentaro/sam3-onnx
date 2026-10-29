@@ -85,7 +85,8 @@ def test_postprocess() -> None:
 
         postprocess(onnx_file)
 
-        assert not (tmp_path / "model.onnx.data").exists()
+        # Kept for other models that may share it, and no longer read.
+        (tmp_path / "model.onnx.data").unlink()
         actual = onnxruntime.InferenceSession(onnx_file).run(None, feeds)
         for a, e in zip(actual, expected):
             np.testing.assert_array_equal(a, e)

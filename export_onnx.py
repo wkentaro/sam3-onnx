@@ -66,6 +66,12 @@ class _ImageEncoder(torch.nn.Module):
         )
 
 
+def _postprocess(onnx_file: pathlib.Path) -> None:
+    postprocess(onnx_file)
+    # torch writes this file for this model alone, and nothing reads it now.
+    (onnx_file.parent / f"{onnx_file.name}.data").unlink(missing_ok=True)
+
+
 def _export_image_encoder(
     processor: Sam3Processor, image: PIL.Image.Image
 ) -> tuple[list[NDArray], list[NDArray], list[NDArray]]:
@@ -105,7 +111,7 @@ def _export_image_encoder(
             verify=True,
         )
         logger.debug("exported onnx model: {!r}", str(onnx_file))
-        postprocess(onnx_file)
+        _postprocess(onnx_file)
 
     session: onnxruntime.InferenceSession = onnxruntime.InferenceSession(onnx_file)
     output = session.run(None, {"image": np.asarray(image).transpose(2, 0, 1)})
@@ -166,7 +172,7 @@ def _export_language_encoder(processor: Sam3Processor) -> list[NDArray]:
             verify=True,
         )
         logger.debug("exported onnx model: {!r}", str(onnx_file))
-        postprocess(onnx_file)
+        _postprocess(onnx_file)
 
     session: onnxruntime.InferenceSession = onnxruntime.InferenceSession(onnx_file)
     output = session.run(None, {"tokens": tokens})
@@ -306,7 +312,7 @@ def _export_decoder(
             verify=True,
         )
         logger.debug("exported onnx model: {!r}", str(onnx_file))
-        postprocess(onnx_file)
+        _postprocess(onnx_file)
 
     session = onnxruntime.InferenceSession(onnx_file)
     output = session.run(
@@ -403,7 +409,7 @@ def _export_point_decoder(
             verify=True,
         )
         logger.debug("exported onnx model: {!r}", str(onnx_file))
-        postprocess(onnx_file)
+        _postprocess(onnx_file)
 
     return onnxruntime.InferenceSession(onnx_file)
 

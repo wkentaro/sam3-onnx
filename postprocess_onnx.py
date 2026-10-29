@@ -17,14 +17,9 @@ def postprocess(onnx_file: pathlib.Path) -> None:
     Every rewrite is exact, so CPU and CUDA outputs stay the same. CoreML runs a
     graph it fully supports as one partition instead of tens, and its EP cannot
     read external data (it resolves the .data file against the .onnx file path).
+    The external data file stays, as other models may share it.
     """
     model: onnx.ModelProto = onnx.load(onnx_file, load_external_data=False)
-    data_files: set[str] = {
-        entry.value
-        for tensor in model.graph.initializer
-        for entry in tensor.external_data
-        if entry.key == "location"
-    }
     # Before the weights load, as shape inference copies the model.
     shapes: dict[str, list[int]] = _static_shapes(model)
     onnx.load_external_data_for_model(model, str(onnx_file.parent))
@@ -174,9 +169,6 @@ def postprocess(onnx_file: pathlib.Path) -> None:
 
     # Raises for models over protobuf's 2 GB, which would need external data.
     onnx.save(model, onnx_file)
-    # Only the file torch writes for this model; others may be shared.
-    if f"{onnx_file.name}.data" in data_files:
-        (onnx_file.parent / f"{onnx_file.name}.data").unlink()
     logger.debug("postprocessed onnx model: {!r}", str(onnx_file))
 
 
