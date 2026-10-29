@@ -198,7 +198,7 @@ def create_sessions(
         if pathlib.Path("models/sam3_image_encoder.onnx.data").exists():
             logger.error(
                 "CoreML needs models with inline weights, run: "
-                "uv run postprocess_onnx.py models/*.onnx"
+                "uv run postprocess_onnx.py models/*.onnx && rm models/*.onnx.data"
             )
             sys.exit(1)
         # MLProgram supports more operators than the default NeuralNetwork, and
