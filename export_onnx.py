@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import copy
 import pathlib
 import typing
@@ -13,6 +14,9 @@ import torch
 from loguru import logger
 from numpy.typing import NDArray
 from osam._models.yoloworld.clip import tokenize
+from sam3.model.sam3_image import Sam3Image  # type: ignore[unresolved-import]
+from sam3.model.sam3_image_processor import Sam3Processor  # type: ignore[unresolved-import]
+from sam3.model_builder import build_sam3_image_model  # type: ignore[unresolved-import]
 from torchvision.transforms import v2
 
 from infer_onnx import postprocess_decoder_output
@@ -21,12 +25,6 @@ from infer_onnx import preprocess_image
 from infer_onnx import run_point_decoder
 from infer_torch import get_replace_freqs_cis
 from postprocess_onnx import postprocess
-from sam3.model.sam3_image import Sam3Image  # type: ignore[unresolved-import]
-from sam3.model.sam3_image_processor import (  # type: ignore[unresolved-import]
-    Sam3Processor,
-)
-from sam3.model_builder import build_sam3_image_model  # type: ignore[unresolved-import]
-
 
 MAX_BOXES: int = 16
 
@@ -423,7 +421,46 @@ def _export_point_decoder(
     return onnxruntime.InferenceSession(onnx_file)
 
 
+def _export_litetext_language_encoder(
+    source: pathlib.Path, variant: str, checkpoint: pathlib.Path | None
+) -> None:
+    from litetext import load_litetext_encoder
+
+    onnx_file = pathlib.Path(f"models/sam3_litetext_{variant}_language_encoder.onnx")
+    if onnx_file.exists():
+        logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
+        return
+    encoder = load_litetext_encoder(source, variant, checkpoint)
+    tokens = torch.from_numpy(tokenize(texts=["person"], context_length=16))
+    onnx_file.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(
+        encoder,
+        args=(tokens,),
+        f=onnx_file,
+        input_names=["tokens"],
+        output_names=["text_attention_mask", "text_memory", "text_embeds"],
+        opset_version=21,
+        verify=True,
+    )
+    _postprocess(onnx_file)
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--litetext", choices=["s0", "s1", "l"])
+    parser.add_argument("--litetext-source", type=pathlib.Path)
+    parser.add_argument("--litetext-checkpoint", type=pathlib.Path)
+    args = parser.parse_args()
+    if args.litetext:
+        if args.litetext_source is None:
+            parser.error("--litetext requires --litetext-source")
+        _export_litetext_language_encoder(
+            args.litetext_source, args.litetext, args.litetext_checkpoint
+        )
+        return
+    if args.litetext_source or args.litetext_checkpoint:
+        parser.error("--litetext-source and --litetext-checkpoint require --litetext")
+
     model: Sam3Image = build_sam3_image_model(enable_inst_interactivity=True)
     # The tracker enters bfloat16 autocast for the whole process on construction,
     # which puts bfloat16 Convs into the exported model.
