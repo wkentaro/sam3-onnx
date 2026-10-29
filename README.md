@@ -59,8 +59,8 @@ uv run postprocess_onnx.py models/*.onnx && rm models/*.onnx.data
 uv run infer_onnx.py --image images/bus.jpg --text-prompt person
 
 # with box prompt
-uv run infer_torch.py --image images/bus.jpg --box-prompt 0.548,0.658,0.043,0.095
-uv run infer_torch.py --image images/bus.jpg --box-prompt  # opens a gui to select box
+uv run infer_onnx.py --image images/bus.jpg --box-prompt 0.548,0.658,0.043,0.095
+uv run infer_onnx.py --image images/bus.jpg --box-prompt  # opens a gui to select box
 
 # with point prompt: x,y[,label] (normalized, label 0 for background), repeatable
 uv run infer_onnx.py --image images/bus.jpg --point-prompt 0.18,0.55
