@@ -23,15 +23,13 @@ def get_replace_freqs_cis(module):
 
 def main() -> None:
     args = parse_args()
+    if args.litetext:
+        raise ValueError("--litetext is supported by infer_onnx.py")
 
     # XXX: those imports has to be after cv2.selectROI to avoid segfault
     from sam3.model.sam3_image import Sam3Image  # type: ignore[unresolved-import]
-    from sam3.model.sam3_image_processor import (  # type: ignore[unresolved-import]
-        Sam3Processor,
-    )
-    from sam3.model_builder import (  # type: ignore[unresolved-import]
-        build_sam3_image_model,
-    )
+    from sam3.model.sam3_image_processor import Sam3Processor  # type: ignore[unresolved-import]
+    from sam3.model_builder import build_sam3_image_model  # type: ignore[unresolved-import]
 
     model: Sam3Image = build_sam3_image_model(
         enable_inst_interactivity=bool(args.point_prompt)

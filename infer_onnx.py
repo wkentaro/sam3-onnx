@@ -49,6 +49,11 @@ def parse_args() -> argparse.Namespace:
         "(normalized, label 1 for foreground and 0 for background). Repeatable.",
     )
     parser.add_argument(
+        "--litetext",
+        choices=["s0", "s1", "l"],
+        help="Use a SAM3-LiteText language encoder exported with --litetext.",
+    )
+    parser.add_argument(
         "--device",
         choices=["cpu", "cuda", "coreml"],
         default="cpu",
@@ -247,6 +252,8 @@ def main():
     decoder_names: list[str] = (
         ["point_decoder"] if args.point_prompt else ["language_encoder", "decoder"]
     )
+    if args.litetext and not args.point_prompt:
+        decoder_names[0] = f"litetext_{args.litetext}_language_encoder"
     sess_image, *sess_decoders = create_sessions(
         device=args.device, names=["image_encoder", *decoder_names]
     )
@@ -301,7 +308,14 @@ def main():
     logger.debug("running language encoder...")
     text_prompt: str = args.text_prompt if args.text_prompt else "visual"
     output = sess_language.run(
-        None, {"tokens": tokenize(texts=[text_prompt], context_length=32)}
+        None,
+        {
+            "tokens": tokenize(
+                texts=[text_prompt],
+                context_length=16 if args.litetext else 32,
+                truncate=bool(args.litetext),
+            )
+        },
     )
     assert len(output) == 3
     assert all(isinstance(o, np.ndarray) for o in output)
