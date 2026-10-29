@@ -63,10 +63,16 @@ def parse_args() -> argparse.Namespace:
     if not (args.text_prompt or args.box_prompt or args.point_prompt):
         parser.error("one of --text-prompt, --box-prompt, --point-prompt is required")
 
+    if args.box_prompt and len(args.box_prompt) > 1 and "0,0,0,0" in args.box_prompt:
+        parser.error("--box-prompt without a value can't be repeated")
+
     if args.box_prompt:
         boxes = [[float(x) for x in b.split(",")] for b in args.box_prompt]
         if any(len(b) not in (4, 5) for b in boxes):
             logger.error("box_prompt must have 4 or 5 values: cx, cy, w, h[, label]")
+            sys.exit(1)
+        if any(len(b) == 5 and b[4] not in (0, 1) for b in boxes):
+            logger.error("box_prompt label must be 0 or 1")
             sys.exit(1)
         args.box_prompt = [b if len(b) == 5 else [*b, 1] for b in boxes]
 
