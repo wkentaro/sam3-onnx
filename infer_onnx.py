@@ -8,10 +8,12 @@ import typing
 import cv2
 import imgviz
 import numpy as np
+import onnx
 import onnxruntime
 import PIL.Image
 from loguru import logger
 from numpy.typing import NDArray
+from onnx import numpy_helper
 from osam._models.yoloworld.clip import tokenize
 from osam.types._model import _setup_cuda
 
@@ -199,6 +201,31 @@ def run_point_decoder(
     return iou_predictions, low_res_masks
 
 
+def load_for_coreml(onnx_file: str) -> bytes:
+    """Rewrite Gemm(transB=0) to Gemm(transB=1) with W {N, K}.
+
+    The CoreML EP loads transB=0 in minutes, as it writes the transposed W into
+    the model as text.
+    """
+    model: onnx.ModelProto = onnx.load(onnx_file)
+    initializers = {i.name: i for i in model.graph.initializer}
+    for node in model.graph.node:
+        if node.op_type != "Gemm":
+            continue
+        trans_b = next((a for a in node.attribute if a.name == "transB"), None)
+        if trans_b is not None and trans_b.i == 1:
+            continue
+        weight = initializers[node.input[1]]
+        weight.CopyFrom(
+            numpy_helper.from_array(numpy_helper.to_array(weight).T, weight.name)
+        )
+        if trans_b is None:
+            node.attribute.append(onnx.helper.make_attribute("transB", 1))
+        else:
+            trans_b.i = 1
+    return model.SerializeToString()
+
+
 def create_sessions(
     device: str, names: list[str]
 ) -> list[onnxruntime.InferenceSession]:
@@ -238,10 +265,13 @@ def create_sessions(
         # Only the image encoder: the decoders take longer to compile for CoreML
         # than it saves them.
         session_providers: list[str | tuple[str, dict[str, str]]] = [*providers]
+        model: str | bytes = f"models/sam3_{name}.onnx"
         if coreml_options is not None and name == "image_encoder":
             session_providers.insert(0, ("CoreMLExecutionProvider", coreml_options))
+            # ponytail: rewritten on every run (~2 s); cache it if that matters.
+            model = load_for_coreml(model)
         session = onnxruntime.InferenceSession(
-            f"models/sam3_{name}.onnx", sess_options, providers=session_providers
+            model, sess_options, providers=session_providers
         )
         # onnxruntime silently falls back to CPU for a provider it can't use.
         (provider, *_) = session_providers

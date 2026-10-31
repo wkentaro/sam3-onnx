@@ -11,8 +11,8 @@ from onnx import numpy_helper
 
 
 def postprocess(onnx_file: pathlib.Path) -> None:
-    """Rewrite ops that onnxruntime's CoreML EP rejects or loads slowly, and inline
-    the weights.
+    """Rewrite ops that onnxruntime's CoreML EP rejects or loads slowly, or that its
+    WebGPU EP runs slowly, and inline the weights.
 
     Every rewrite is exact, so CPU and CUDA outputs stay the same. CoreML runs a
     graph it fully supports as one partition instead of tens, and its EP cannot
@@ -60,9 +60,8 @@ def postprocess(onnx_file: pathlib.Path) -> None:
             continue
 
         # MatMul(x, W) + Add(b) -> Reshape, Gemm, Reshape, as onnxruntime fuses
-        # them for static shapes, but with W already {N, K} (transB=1). Otherwise
-        # the CoreML EP writes the transposed W into the model as text, which
-        # takes Core ML minutes to load.
+        # them for static shapes, so CoreML loaders can rewrite every linear
+        # layer to transB=1 (see below).
         weight: onnx.TensorProto | None = (
             initializers.get(node.input[1]) if node.op_type == "MatMul" else None
         )
@@ -89,9 +88,6 @@ def postprocess(onnx_file: pathlib.Path) -> None:
             (k, n) = weight.dims
             output = add.output[0]
             (x_2d, y_2d) = (f"{output}_2d", f"{output}_gemm")
-            w_t = add_constant(
-                f"{output}_weight", numpy_helper.to_array(weight).T.copy()
-            )
             shape_2d = add_constant(f"{x_2d}_shape", np.array([-1, k]))
             shape_nd = add_constant(f"{output}_shape", np.array([*x_shape[:-1], n]))
             nodes += [
@@ -99,7 +95,7 @@ def postprocess(onnx_file: pathlib.Path) -> None:
                     "Reshape", [node.input[0], shape_2d], [x_2d], name=x_2d
                 ),
                 helper.make_node(
-                    "Gemm", [x_2d, w_t, bias], [y_2d], name=y_2d, transB=1
+                    "Gemm", [x_2d, node.input[1], bias], [y_2d], name=y_2d
                 ),
                 helper.make_node("Reshape", [y_2d, shape_nd], [output], name=output),
             ]
@@ -107,6 +103,19 @@ def postprocess(onnx_file: pathlib.Path) -> None:
             changed.add(node.output[0])
             continue
         nodes.append(node)
+
+        # Gemm(transB=1) -> Gemm(transB=0) with W {K, N}, as onnxruntime's WebGPU
+        # EP runs transB=1 at half the speed. The CoreML EP loads transB=0 in
+        # minutes, as it writes the transposed W into the model as text, so osam
+        # rewrites it back to transB=1 for CoreML.
+        trans_b = next((a for a in node.attribute if a.name == "transB"), None)
+        weight = initializers.get(node.input[1]) if node.op_type == "Gemm" else None
+        if trans_b is not None and trans_b.i == 1 and weight is not None:
+            node.input[1] = add_constant(
+                f"{node.output[0]}_weight", numpy_helper.to_array(weight).T
+            )
+            trans_b.i = 0
+            continue
 
         indices: np.ndarray | None = (
             constants.get(node.input[1]) if node.op_type == "Gather" else None
@@ -167,7 +176,7 @@ def postprocess(onnx_file: pathlib.Path) -> None:
     value_info = [v for v in graph.value_info if v.name not in changed]
     del graph.value_info[:]
     graph.value_info.extend(value_info)
-    # Drop the scalar indices, rank-6 shapes and {K, N} weights nothing reads.
+    # Drop the scalar indices, rank-6 shapes and {N, K} weights nothing reads.
     used: set[str] = {name for n in _all_nodes(graph) for name in n.input}
     used.update(o.name for o in graph.output)
     for index in reversed(range(len(graph.initializer))):
