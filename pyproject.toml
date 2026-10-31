@@ -5,6 +5,7 @@ requires-python = ">=3.13"
 dependencies = [
     "imgviz>=1.7.6",
     "loguru>=0.7.3",
+    "onnx>=1.20.0",
     "opencv-python>=4.11.0.86",
     "osam",
 ]
