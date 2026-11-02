@@ -216,6 +216,28 @@ def run_point_decoder(
     return iou_predictions, low_res_masks
 
 
+def get_max_boxes(session: onnxruntime.InferenceSession) -> int:
+    (box_input,) = [i for i in session.get_inputs() if i.name == "box_coords"]
+    return box_input.shape[0]
+
+
+def make_box_inputs(
+    session: onnxruntime.InferenceSession,
+    boxes: typing.Sequence[typing.Sequence[float]],
+) -> dict[str, NDArray]:
+    """The decoder takes a fixed number of boxes, given as [cx, cy, w, h, label]
+    rows, and masks out the unused ones."""
+    max_boxes = get_max_boxes(session)
+    box_coords = np.zeros((max_boxes, 1, 4), dtype=np.float32)
+    box_labels = np.ones((max_boxes, 1), dtype=np.int64)
+    box_masks = np.ones((1, max_boxes), dtype=np.bool_)
+    for i, box in enumerate(boxes):
+        box_coords[i, 0] = box[:4]
+        box_labels[i, 0] = box[4]
+        box_masks[0, i] = False
+    return {"box_coords": box_coords, "box_labels": box_labels, "box_masks": box_masks}
+
+
 def load_for_coreml(onnx_file: str) -> bytes:
     """Rewrite Gemm(transB=0) to Gemm(transB=1) with W {N, K}.
 
@@ -387,22 +409,14 @@ def main():
     logger.debug("finished running language encoder")
 
     logger.debug("running decoder...")
-    # The decoder takes a fixed number of boxes, and masks out the unused ones.
     box_prompt: list[list[float]] = args.box_prompt or []
-    (box_input,) = [i for i in sess_decode.get_inputs() if i.name == "box_coords"]
-    max_boxes: int = box_input.shape[0]
+    max_boxes = get_max_boxes(sess_decode)
     if len(box_prompt) > max_boxes:
         logger.error("box_prompt must have at most {} boxes", max_boxes)
         sys.exit(1)
-    box_coords: NDArray[np.float32] = np.zeros((max_boxes, 1, 4), dtype=np.float32)
-    box_labels: NDArray[np.int64] = np.ones((max_boxes, 1), dtype=np.int64)
-    box_masks: NDArray[np.bool_] = np.ones((1, max_boxes), dtype=np.bool_)
-    for i, box in enumerate(box_prompt):
-        box_coords[i, 0] = box[:4]
-        box_labels[i, 0] = box[4]
-        box_masks[0, i] = False
+    box_inputs = make_box_inputs(sess_decode, box_prompt)
     output = sess_decode.run(
-        None,
+        ["boxes", "scores", "masks"],
         {
             "backbone_fpn_0": backbone_fpn[0],
             "backbone_fpn_1": backbone_fpn[1],
@@ -410,9 +424,7 @@ def main():
             "vision_pos_enc_2": vision_pos_enc[2],
             "language_mask": language_mask,
             "language_features": language_features,
-            "box_coords": box_coords,
-            "box_labels": box_labels,
-            "box_masks": box_masks,
+            **box_inputs,
         },
     )
     assert len(output) == 3
