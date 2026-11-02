@@ -54,6 +54,8 @@ def _resize(x: NDArray[np.float32], height: int, width: int) -> NDArray[np.float
     """F.interpolate(mode="bilinear", align_corners=False) of (N, 1, H, W)."""
     if x.shape[-2:] == (height, width):
         return x
+    if len(x) == 0:
+        return np.zeros((0, 1, height, width), x.dtype)
     return np.stack(
         [
             cv2.resize(m[0], (width, height), interpolation=cv2.INTER_LINEAR)[None]
@@ -69,6 +71,8 @@ def _resize_antialias(
     follows PIL's bilinear filter."""
     if x.shape[-2:] == (height, width):
         return x
+    if len(x) == 0:
+        return np.zeros((0, 1, height, width), x.dtype)
     return np.stack(
         [
             np.asarray(

@@ -140,14 +140,43 @@ def main() -> None:
         _, actual = video.add_prompt(frame_idx, **kwargs)
         check(name, [expected], [actual])
 
-    def propagate(name: str, **kwargs) -> None:
+    def propagate(name: str, **kwargs) -> dict[int, VideoOutput]:
         expected = dict(model.propagate_in_video(state, **kwargs))
         actual = dict(video.propagate_in_video(**kwargs))
         assert list(expected) == list(actual), (list(expected), list(actual))
         check(name, list(expected.values()), list(actual.values()))
+        return expected
+
+    def click(mask: NDArray[np.bool_]) -> NDArray[np.float32]:
+        """A pixel of the mask, normalized by the video size."""
+        y, x = np.argwhere(mask)[mask.sum() // 2]
+        return np.array([[(x + 0.5) / width, (y + 0.5) / height]], np.float32)
 
     prompt("text", 0, text_str="person")
-    propagate("text: forward")
+    out = propagate("text: forward")[20]
+    obj_id = int(out["out_obj_ids"][0])
+    new_obj_id = int(out["out_obj_ids"].max()) + 1
+    labels = np.array([1], np.int32)
+    prompt(
+        "refine",
+        20,
+        points=click(out["out_binary_masks"][0]),
+        point_labels=labels,
+        obj_id=obj_id,
+    )
+    prompt(
+        "add",
+        20,
+        points=click(~np.any(out["out_binary_masks"], axis=0)),
+        point_labels=labels,
+        obj_id=new_obj_id,
+    )
+    propagate("refine and add: forward", start_frame_idx=20)
+    propagate("refine and add: reverse", start_frame_idx=20, reverse=True)
+    propagate("refine and add: fetch")
+    model.remove_object(state, obj_id, is_user_action=True)
+    video.remove_object(obj_id)
+    propagate("remove: fetch")
 
     # The box that test_video_parity.py tracks.
     box_xywh = np.array([[300 / width, 0, 200 / width, 400 / height]])

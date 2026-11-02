@@ -45,6 +45,8 @@ RECONDITION_EVERY_NTH_FRAME: int = 16
 # Sam3VideoBase._associate_det_trk and _recondition_masklets
 HIGH_CONF_THRESH: float = 0.8
 HIGH_IOU_THRESH: float = 0.8
+# Sam3VideoInferenceWithInstanceInteractivity
+REFINEMENT_DETECTOR_COND_FRAME_REMOVAL_WINDOW: int = 16
 
 # The sessions VideoInference runs, as models/sam3_{name}.onnx. The caller runs
 # the image encoder, with encode_frame.
@@ -201,6 +203,9 @@ class VideoInference:
             collections.defaultdict(list)
         )
         self.removed_obj_ids: set[int] = set()
+        # frame_idx -> obj_id -> the mask that propagation output on that frame
+        self.cached_frame_outputs: dict[int, dict[int, NDArray[np.bool_]]] = {}
+        self.action_history: list[dict[str, typing.Any]] = []
 
     # Models {{
 
@@ -274,12 +279,22 @@ class VideoInference:
         text_str: str | None = None,
         boxes_xywh: NDArray | None = None,
         box_labels: NDArray | None = None,
+        points: NDArray | None = None,
+        point_labels: NDArray | None = None,
+        obj_id: int | None = None,
     ) -> tuple[int, VideoOutput]:
         """Prompt with a text, a box (x, y, w, h) normalized by the video size,
         or both, on one frame, and return the outputs on that frame.
 
         The prompt applies to every frame, and starts over the tracking.
+        Points instead refine or add one object, as add_tracker_new_points.
         """
+        if points is not None:
+            if text_str is not None or boxes_xywh is not None:
+                raise ValueError("points can't be given with text_str or boxes_xywh")
+            if point_labels is None or obj_id is None:
+                raise ValueError("points need point_labels and obj_id")
+            return self.add_tracker_new_points(frame_idx, obj_id, points, point_labels)
         if text_str is None and boxes_xywh is None:
             raise ValueError("at least one of text_str or boxes_xywh must be given")
         if not 0 <= frame_idx < self.num_frames:
@@ -326,14 +341,14 @@ class VideoInference:
         )
         return range(start_frame_idx, end_frame_idx + 1), end_frame_idx
 
-    def propagate_in_video(
+    def _propagate_full(
         self,
-        start_frame_idx: int | None = None,
-        max_frame_num_to_track: int | None = None,
-        reverse: bool = False,
+        start_frame_idx: int | None,
+        max_frame_num_to_track: int | None,
+        reverse: bool,
     ) -> typing.Iterator[tuple[int, VideoOutput]]:
-        """Yield the outputs of each frame. Frames come out HOTSTART_DELAY frames
-        late, so objects that hotstart removes never show up."""
+        """Sam3VideoInference.propagate_in_video. Frames come out HOTSTART_DELAY
+        frames late, so objects that hotstart removes never show up."""
         processing_order, end_frame_idx = self._get_processing_order(
             start_frame_idx, max_frame_num_to_track, reverse
         )
@@ -350,6 +365,11 @@ class VideoInference:
             else:
                 continue
             for yield_frame_idx, yield_out in yield_list:
+                self._cache_frame_outputs(
+                    yield_frame_idx,
+                    yield_out["obj_id_to_mask"],
+                    removed_obj_ids=hotstart_removed_obj_ids,
+                )
                 yield (
                     yield_frame_idx,
                     self._postprocess_output(yield_out, hotstart_removed_obj_ids),
@@ -365,6 +385,14 @@ class VideoInference:
             or frame_idx in self.per_frame_geometric_prompt,
         )
         self.frames_with_outputs.add(frame_idx)
+        return {
+            **self._frame_output(frame_idx, obj_id_to_mask),
+            "removed_obj_ids": set(self.removed_obj_ids),
+        }
+
+    def _frame_output(
+        self, frame_idx: int, obj_id_to_mask: dict[int, NDArray[np.bool_]]
+    ) -> dict[str, typing.Any]:
         # Snapshots, as upstream copies the metadata on every frame.
         return {
             "obj_id_to_mask": obj_id_to_mask,
@@ -372,8 +400,24 @@ class VideoInference:
             "obj_id_to_tracker_score": dict(
                 self.obj_id_to_tracker_score_frame_wise[frame_idx]
             ),
-            "removed_obj_ids": set(self.removed_obj_ids),
         }
+
+    def _cache_frame_outputs(
+        self,
+        frame_idx: int,
+        obj_id_to_mask: dict[int, NDArray[np.bool_]],
+        removed_obj_ids: typing.Collection[int] = (),
+    ) -> None:
+        self.cached_frame_outputs[frame_idx] = {
+            obj_id: mask
+            for obj_id, mask in obj_id_to_mask.items()
+            if obj_id not in removed_obj_ids
+        }
+
+    def _build_tracker_output(
+        self, frame_idx: int, refined_obj_id_to_mask: dict[int, NDArray[np.bool_]]
+    ) -> dict[int, NDArray[np.bool_]]:
+        return {**self.cached_frame_outputs[frame_idx], **refined_obj_id_to_mask}
 
     def _postprocess_output(
         self, out: dict[str, typing.Any], removed_obj_ids: typing.Collection[int] = ()
@@ -413,6 +457,199 @@ class VideoInference:
 
     # }}
 
+    # Sam3VideoInferenceWithInstanceInteractivity {{
+
+    def propagate_in_video(
+        self,
+        start_frame_idx: int | None = None,
+        max_frame_num_to_track: int | None = None,
+        reverse: bool = False,
+    ) -> typing.Iterator[tuple[int, VideoOutput]]:
+        """Yield the outputs of each frame.
+
+        After a text or box prompt, the first two propagations track every
+        object, one per direction. Later ones track only the objects that
+        points added or refined since the last propagation and merge them into
+        the earlier outputs, or return the earlier outputs when there are none.
+        """
+        propagation_type, obj_ids = self._parse_action_history_for_propagation()
+        processing_order, _ = self._get_processing_order(
+            start_frame_idx, max_frame_num_to_track, reverse
+        )
+        uncached = [i for i in processing_order if i not in self.cached_frame_outputs]
+        if propagation_type != "propagation_full" and uncached:
+            # Upstream returns these frames empty, or fails on a KeyError.
+            raise RuntimeError(
+                f"frames {min(uncached)} to {max(uncached)} have no outputs, as "
+                "only the first two propagations after a text or box prompt "
+                "run detection; prompt again to propagate them"
+            )
+        self._add_action_history(propagation_type, start_frame_idx, obj_ids)
+        if propagation_type == "propagation_full":
+            yield from self._propagate_full(
+                start_frame_idx, max_frame_num_to_track, reverse
+            )
+            return
+
+        if propagation_type == "propagation_fetch":
+            for frame_idx in processing_order:
+                obj_id_to_mask = self.cached_frame_outputs[frame_idx]
+                yield (
+                    frame_idx,
+                    self._postprocess_output(
+                        self._frame_output(frame_idx, obj_id_to_mask)
+                    ),
+                )
+            return
+
+        assert obj_ids is not None
+        refined_obj_ids = set(obj_ids)
+        trackers = self._get_tracker_inference_states_by_obj_ids(refined_obj_ids)
+        for tracker in trackers:
+            tracker.propagate_in_video_preflight()
+        for frame_idx in processing_order:
+            trk_obj_ids, low_res_masks, trk_scores = self._run_tracker_propagation(
+                frame_idx, reverse, trackers, run_mem_encoder=True
+            )
+            refined = [
+                i for i, obj_id in enumerate(trk_obj_ids) if obj_id in refined_obj_ids
+            ]
+            video_res_masks = (
+                _resize(
+                    low_res_masks[refined, None], self.video_height, self.video_width
+                )[:, 0]
+                > 0
+            )
+            # The logits, where full propagation stores their sigmoid, as
+            # upstream does.
+            self.obj_id_to_tracker_score_frame_wise[frame_idx].update(
+                (trk_obj_ids[i], float(trk_scores[i])) for i in refined
+            )
+            obj_id_to_mask = self._build_tracker_output(
+                frame_idx, dict(zip([trk_obj_ids[i] for i in refined], video_res_masks))
+            )
+            self._cache_frame_outputs(frame_idx, obj_id_to_mask)
+            yield (
+                frame_idx,
+                self._postprocess_output(self._frame_output(frame_idx, obj_id_to_mask)),
+            )
+
+    def _add_action_history(
+        self, action_type: str, frame_idx: int | None, obj_ids: list[int] | None
+    ) -> None:
+        """Record "add", "remove", "refine", or a propagation type, from which
+        the next propagation decides what to run."""
+        self.action_history.append(
+            {"type": action_type, "frame_idx": frame_idx, "obj_ids": obj_ids}
+        )
+
+    def _parse_action_history_for_propagation(
+        self,
+    ) -> tuple[str, list[int] | None]:
+        """parse_action_history_for_propagation: "propagation_full" for every
+        object, "propagation_partial" with the objects to track, or
+        "propagation_fetch" for the cached outputs."""
+        action_history = self.action_history
+        # Unlike upstream, which checks for an empty history, also run it after
+        # removing objects before the first propagation.
+        if not any(a["type"].startswith("propagation") for a in action_history):
+            return "propagation_full", None
+        last = action_history[-1]
+        if last["type"] == "propagation_fetch":
+            return "propagation_fetch", None
+        if last["type"] in ("propagation_partial", "propagation_full"):
+            # Both directions have run, or one ran from either end.
+            if (
+                len(action_history) > 1
+                and action_history[-2]["type"]
+                in ("propagation_partial", "propagation_full")
+            ) or last["frame_idx"] in (0, self.num_frames - 1):
+                return "propagation_fetch", None
+            return last["type"], last["obj_ids"]
+        obj_ids: set[int] = set()
+        for action in reversed(action_history):
+            if action["type"].startswith("propagation"):
+                break
+            if action["type"] in ("add", "refine"):
+                obj_ids.update(action["obj_ids"])
+        if not obj_ids:
+            return "propagation_fetch", None
+        return "propagation_partial", sorted(obj_ids)
+
+    def remove_object(self, obj_id: int) -> None:
+        """Remove an object from every frame, as a user action."""
+        if obj_id not in self.obj_ids:
+            raise ValueError(f"object {obj_id} is not tracked")
+        self._tracker_remove_object(obj_id)
+        self._add_action_history("remove", None, [obj_id])
+        self.obj_ids = self.obj_ids[self.obj_ids != obj_id]
+        self.obj_id_to_score.pop(obj_id, None)
+
+    def add_tracker_new_points(
+        self, frame_idx: int, obj_id: int, points: NDArray, labels: NDArray
+    ) -> tuple[int, VideoOutput]:
+        """Refine an object with points (N, 2) normalized by the video size and
+        their labels (N,), replacing its earlier points on that frame, or add a
+        new object with a new obj_id. Return the outputs on that frame."""
+        if frame_idx not in self.cached_frame_outputs:
+            raise RuntimeError(
+                f"frame {frame_idx} has no outputs yet, propagate before adding points"
+            )
+        if obj_id in self.obj_ids:
+            (tracker,) = self._get_tracker_inference_states_by_obj_ids([obj_id])
+            self._add_action_history("refine", frame_idx, [obj_id])
+        else:
+            tracker = self._new_tracker()
+            self.trackers.append(tracker)
+            self.obj_ids = np.append(self.obj_ids, np.int64(obj_id))
+            self.max_obj_id = max(self.max_obj_id, obj_id)
+            self._add_action_history("add", frame_idx, [obj_id])
+
+        # A higher score for the object that the user added or refined
+        self.obj_id_to_score[obj_id] = 1.0
+        self.obj_id_to_tracker_score_frame_wise[frame_idx][obj_id] = 1.0
+        self.removed_obj_ids.discard(obj_id)
+
+        _, obj_ids, video_res_masks = tracker.add_new_points_or_box(
+            frame_idx, obj_id, points=points, labels=labels
+        )
+        # Upstream fills the holes of every object's mask and keeps only this one.
+        (mask,) = _fill_holes_in_mask_scores(video_res_masks[obj_ids.index(obj_id)])
+        tracker.propagate_in_video_preflight()
+        self._clear_detector_added_cond_frame_in_tracker(tracker, obj_id, frame_idx)
+
+        obj_id_to_mask = self._build_tracker_output(frame_idx, {obj_id: mask > 0})
+        self._cache_frame_outputs(frame_idx, obj_id_to_mask)
+        return frame_idx, self._postprocess_output(
+            self._frame_output(frame_idx, obj_id_to_mask)
+        )
+
+    def _get_tracker_inference_states_by_obj_ids(
+        self, obj_ids: typing.Collection[int]
+    ) -> list[Tracker]:
+        return [t for t in self.trackers if not set(obj_ids).isdisjoint(t.obj_ids)]
+
+    def _clear_detector_added_cond_frame_in_tracker(
+        self, tracker: Tracker, obj_id: int, refined_frame_idx: int
+    ) -> None:
+        """Clear the detector's masks near the refined frame, so the tracker
+        can update the masks there."""
+        obj_idx = tracker.obj_id_to_idx[obj_id]
+        mask_only_cond_frame_indices = [
+            frame_idx
+            for frame_idx in tracker.mask_inputs_per_obj[obj_idx]
+            if frame_idx not in tracker.point_inputs_per_obj[obj_idx]
+            and abs(frame_idx - refined_frame_idx)
+            <= REFINEMENT_DETECTOR_COND_FRAME_REMOVAL_WINDOW
+        ]
+        for frame_idx in mask_only_cond_frame_indices:
+            # This also clears the points of other objects on that frame, as
+            # upstream does.
+            for obj_id2 in list(tracker.obj_ids):
+                tracker.clear_all_points_in_frame(frame_idx, obj_id2)
+
+    # }}
+
     # Sam3VideoBase {{
 
     def _det_track_one_frame(
@@ -431,7 +668,10 @@ class VideoInference:
 
         # Step 2: propagate the tracked objects without encoding memories.
         obj_ids_prev = self.obj_ids
-        trk_masks, trk_scores = self._run_tracker_propagation(frame_idx, reverse)
+        trk_obj_ids, trk_masks, trk_scores = self._run_tracker_propagation(
+            frame_idx, reverse
+        )
+        assert trk_obj_ids == obj_ids_prev.tolist()
 
         # Step 3: run_tracker_update_planning_phase
         (
@@ -509,22 +749,35 @@ class VideoInference:
         return obj_id_to_mask
 
     def _run_tracker_propagation(
-        self, frame_idx: int, reverse: bool
-    ) -> tuple[NDArray, NDArray]:
-        """_propogate_tracker_one_frame_local_gpu: the low-res mask logits
-        (N, H, W) and the object score logits (N,) of every tracked object."""
+        self,
+        frame_idx: int,
+        reverse: bool,
+        trackers: list[Tracker] | None = None,
+        run_mem_encoder: bool = False,
+    ) -> tuple[list[int], NDArray, NDArray]:
+        """_propogate_tracker_one_frame_local_gpu: the object ids, low-res mask
+        logits (N, H, W), and object score logits (N,) of the trackers, every
+        tracker by default."""
+        obj_ids: list[int] = []
         masks, scores = [], []
-        for tracker in self.trackers:
-            out = tracker.propagate_one_frame(frame_idx, reverse, run_mem_encoder=False)
+        for tracker in self.trackers if trackers is None else trackers:
+            out = tracker.propagate_one_frame(
+                frame_idx, reverse, run_mem_encoder=run_mem_encoder
+            )
+            obj_ids += tracker.obj_ids
             masks.append(out["pred_masks"][:, 0])
             scores.append(out["object_score_logits"][:, 0])
-        assert [i for t in self.trackers for i in t.obj_ids] == self.obj_ids.tolist()
         if not masks:
             return (
+                [],
                 np.zeros((0, LOW_RES_MASK_SIZE, LOW_RES_MASK_SIZE), np.float32),
                 np.zeros(0, np.float32),
             )
-        return _fill_holes_in_mask_scores(np.concatenate(masks)), np.concatenate(scores)
+        return (
+            obj_ids,
+            _fill_holes_in_mask_scores(np.concatenate(masks)),
+            np.concatenate(scores),
+        )
 
     def _associate_det_trk(
         self,
@@ -726,5 +979,9 @@ class VideoInference:
         for tracker in self.trackers:
             tracker.remove_object(obj_id)
         self.trackers = [tracker for tracker in self.trackers if tracker.obj_ids]
+        # Unlike upstream, which does this only in remove_object, also drop the
+        # objects that hotstart removes from the frames cached before.
+        for frame_cache in self.cached_frame_outputs.values():
+            frame_cache.pop(obj_id, None)
 
     # }}

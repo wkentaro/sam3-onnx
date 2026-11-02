@@ -1,5 +1,7 @@
 import numpy as np
 
+from track_onnx import _resize
+from video_onnx import VideoInference
 from video_onnx import _mask_iou
 from video_onnx import _nms_masks
 
@@ -10,6 +12,7 @@ def test_empty_masks() -> None:
     assert _mask_iou(empty > 0, masks > 0).shape == (0, 2)
     assert _mask_iou(masks > 0, empty > 0).shape == (2, 0)
     assert _nms_masks(np.zeros(0, np.float32), empty, 0.1).tolist() == []
+    assert _resize(empty[:, None], 8, 6).shape == (0, 1, 8, 6)
 
 
 def test_nms_masks() -> None:
@@ -20,7 +23,33 @@ def test_nms_masks() -> None:
     assert _nms_masks(probs, masks, 0.1).tolist() == [1, 2]
 
 
+def test_propagation_history() -> None:
+    video = object.__new__(VideoInference)
+    video.num_frames, video.video_height, video.video_width = 10, 4, 4
+    video.reset_state()
+    video.frames_with_outputs.add(0)
+    video._add_action_history("remove", None, [0])
+    assert video._parse_action_history_for_propagation() == ("propagation_full", None)
+
+    # A propagation from frame 0 that stopped at frame 4
+    video._add_action_history("propagation_full", 0, None)
+    video.cached_frame_outputs.update({i: {} for i in range(5)})
+    assert len(list(video.propagate_in_video(max_frame_num_to_track=4))) == 5
+    try:
+        next(video.propagate_in_video(start_frame_idx=5))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("fetching uncached frames should raise")
+
+    # Hotstart removes an object through _tracker_remove_object.
+    video.cached_frame_outputs[0] = {7: np.ones((4, 4), np.bool_)}
+    video._tracker_remove_object(7)
+    assert video.cached_frame_outputs[0] == {}
+
+
 if __name__ == "__main__":
     test_empty_masks()
     test_nms_masks()
+    test_propagation_history()
     print("ok")
