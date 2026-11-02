@@ -51,6 +51,12 @@ def parse_args() -> argparse.Namespace:
         "(normalized, label 1 for foreground and 0 for background). Repeatable.",
     )
     parser.add_argument(
+        "--single-mask",
+        action="store_true",
+        help="Predict one mask for --point-prompt instead of picking the best of "
+        "3, which suits several points.",
+    )
+    parser.add_argument(
         "--litetext",
         choices=["s0", "s1", "l"],
         help="Use a SAM3-LiteText language encoder exported with --litetext.",
@@ -67,6 +73,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.point_prompt and (args.text_prompt or args.box_prompt):
         parser.error("--point-prompt can't be combined with other prompts")
+    if args.single_mask and not args.point_prompt:
+        parser.error("--single-mask requires --point-prompt")
     if not (args.text_prompt or args.box_prompt or args.point_prompt):
         parser.error("one of --text-prompt, --box-prompt, --point-prompt is required")
 
@@ -178,7 +186,14 @@ def run_point_decoder(
     sess_point_decode: onnxruntime.InferenceSession,
     sam2_features: list[NDArray],
     point_prompt: list[list[float]],
+    multimask_output: bool = True,
 ) -> tuple[NDArray, NDArray]:
+    """Return 3 masks with multimask_output, or else 1 as SAM3 picks it."""
+    output_names = (
+        ["iou_predictions", "low_res_masks"]
+        if multimask_output
+        else ["single_iou_predictions", "single_low_res_masks"]
+    )
     points = np.array(point_prompt, dtype=np.float32)
     inputs: dict[str, NDArray] = {
         "image_embeddings": sam2_features[0],
@@ -190,13 +205,13 @@ def run_point_decoder(
         "has_mask_input": np.array([0], dtype=np.float32),
     }
     iou_predictions, low_res_masks = typing.cast(
-        list[NDArray], sess_point_decode.run(None, inputs)
+        list[NDArray], sess_point_decode.run(output_names, inputs)
     )
     # Refine with the best mask from the first pass as the mask prompt.
     inputs["mask_input"] = low_res_masks[:, [iou_predictions[0].argmax()]]
     inputs["has_mask_input"] = np.array([1], dtype=np.float32)
     iou_predictions, low_res_masks = typing.cast(
-        list[NDArray], sess_point_decode.run(None, inputs)
+        list[NDArray], sess_point_decode.run(output_names, inputs)
     )
     return iou_predictions, low_res_masks
 
@@ -315,11 +330,20 @@ def main():
     logger.debug("finished running image encoder")
 
     if args.point_prompt:
+        if args.single_mask and "single_low_res_masks" not in [
+            o.name for o in sess_decoders[0].get_outputs()
+        ]:
+            logger.error(
+                "models/sam3_point_decoder.onnx predates --single-mask, "
+                "re-export it with: uv run export_onnx.py"
+            )
+            sys.exit(1)
         logger.debug("running point decoder...")
         iou_predictions, low_res_masks = run_point_decoder(
             sess_point_decode=sess_decoders[0],
             sam2_features=output,
             point_prompt=args.point_prompt,
+            multimask_output=not args.single_mask,
         )
         mask, score = postprocess_point_decoder_output(
             iou_predictions=iou_predictions,
