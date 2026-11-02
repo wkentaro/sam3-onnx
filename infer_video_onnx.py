@@ -120,9 +120,11 @@ def main() -> None:
         str(args.output), cv2.VideoWriter.fourcc(*"mp4v"), fps, (width, height)
     )
     for frame_idx, frame in enumerate(frames):
-        viz = imgviz.instances2rgb(
-            image=frame, masks=masks[frame_idx], labels=labels[frame_idx], alpha=0.5
-        )
+        # A label image, so each object keeps its color as others come and go.
+        label = np.zeros((height, width), np.int32)
+        for mask, obj_label in zip(masks[frame_idx], labels[frame_idx]):
+            label[mask] = obj_label
+        viz = imgviz.label2rgb(label, image=frame, alpha=0.5)
         writer.write(np.ascontiguousarray(viz[:, :, ::-1]))
     writer.release()
     logger.info("saved: {}", args.output)
