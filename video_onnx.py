@@ -67,8 +67,9 @@ def encode_frame(
 
 def _mask_iou(a: NDArray[np.bool_], b: NDArray[np.bool_]) -> NDArray[np.float32]:
     """perflib.masks_ops.mask_iou of (N, H, W) and (M, H, W)."""
-    a = a.reshape(len(a), -1).astype(np.float32)
-    b = b.reshape(len(b), -1).astype(np.float32)
+    # reshape(len(a), -1) can't infer the size when a is empty.
+    a = a.reshape(len(a), a.shape[1] * a.shape[2]).astype(np.float32)
+    b = b.reshape(len(b), b.shape[1] * b.shape[2]).astype(np.float32)
     intersection = a @ b.T
     union = a.sum(1)[:, None] + b.sum(1)[None] - intersection
     return intersection / np.maximum(union, 1)
