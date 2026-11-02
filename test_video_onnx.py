@@ -47,6 +47,13 @@ def test_propagation_history() -> None:
     video._tracker_remove_object(7)
     assert video.cached_frame_outputs[0] == {}
 
+    # Forward from the last frame covers one frame, so reverse runs in full.
+    video.action_history = []
+    video._add_action_history("propagation_full", 9, None)
+    assert video._parse_action_history_for_propagation() == ("propagation_full", None)
+    video._add_action_history("propagation_full", 9, None, reverse=True)
+    assert video._parse_action_history_for_propagation()[0] == "propagation_fetch"
+
 
 if __name__ == "__main__":
     test_empty_masks()

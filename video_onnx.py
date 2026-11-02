@@ -484,7 +484,7 @@ class VideoInference:
                 "only the first two propagations after a text or box prompt "
                 "run detection; prompt again to propagate them"
             )
-        self._add_action_history(propagation_type, start_frame_idx, obj_ids)
+        self._add_action_history(propagation_type, start_frame_idx, obj_ids, reverse)
         if propagation_type == "propagation_full":
             yield from self._propagate_full(
                 start_frame_idx, max_frame_num_to_track, reverse
@@ -535,12 +535,21 @@ class VideoInference:
             )
 
     def _add_action_history(
-        self, action_type: str, frame_idx: int | None, obj_ids: list[int] | None
+        self,
+        action_type: str,
+        frame_idx: int | None,
+        obj_ids: list[int] | None,
+        reverse: bool = False,
     ) -> None:
         """Record "add", "remove", "refine", or a propagation type, from which
         the next propagation decides what to run."""
         self.action_history.append(
-            {"type": action_type, "frame_idx": frame_idx, "obj_ids": obj_ids}
+            {
+                "type": action_type,
+                "frame_idx": frame_idx,
+                "obj_ids": obj_ids,
+                "reverse": reverse,
+            }
         )
 
     def _parse_action_history_for_propagation(
@@ -558,12 +567,17 @@ class VideoInference:
         if last["type"] == "propagation_fetch":
             return "propagation_fetch", None
         if last["type"] in ("propagation_partial", "propagation_full"):
-            # Both directions have run, or one ran from either end.
+            # Both directions have run, or one covered every frame. Upstream
+            # fetches after any run from frame 0 or n-1, so after forward from
+            # n-1, which covers one frame.
             if (
                 len(action_history) > 1
                 and action_history[-2]["type"]
                 in ("propagation_partial", "propagation_full")
-            ) or last["frame_idx"] in (0, self.num_frames - 1):
+            ) or (last["frame_idx"], last["reverse"]) in (
+                (0, False),
+                (self.num_frames - 1, True),
+            ):
                 return "propagation_fetch", None
             return last["type"], last["obj_ids"]
         obj_ids: set[int] = set()
