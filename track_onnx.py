@@ -259,7 +259,7 @@ class Tracker:
     def _encode_new_memory(
         self,
         frame_idx: int,
-        low_res_masks: NDArray,
+        high_res_masks: NDArray,
         object_score_logits: NDArray,
         is_mask_from_pts: bool,
         non_overlapping: bool = False,
@@ -269,7 +269,7 @@ class Tracker:
         maskmem_features = self._run(
             "memory_encoder",
             image_embeddings=self._features(frame_idx)[0],
-            mask_logits=low_res_masks,
+            mask_logits=high_res_masks,
             is_mask_from_pts=np.array([is_mask_from_pts], dtype=np.float32),
             object_score_logits=object_score_logits,
             non_overlapping=np.array([non_overlapping], dtype=np.float32),
@@ -453,7 +453,7 @@ class Tracker:
         if run_mem_encoder:
             current_out["maskmem_features"] = self._encode_new_memory(
                 frame_idx,
-                low_res_masks=pred_masks,
+                high_res_masks=_resize(pred_masks, IMAGE_SIZE, IMAGE_SIZE),
                 object_score_logits=object_score_logits,
                 is_mask_from_pts=point_inputs is not None,
             )
@@ -709,7 +709,9 @@ class Tracker:
         if run_mem_encoder:
             consolidated_out["maskmem_features"] = self._encode_new_memory(
                 frame_idx,
-                low_res_masks=consolidated_out["pred_masks"],
+                high_res_masks=_resize(
+                    consolidated_out["pred_masks"], IMAGE_SIZE, IMAGE_SIZE
+                ),
                 object_score_logits=consolidated_out["object_score_logits"],
                 is_mask_from_pts=True,
                 non_overlapping=True,
@@ -788,41 +790,62 @@ class Tracker:
         """Yield the frame index, the object ids, the mask logits at the video
         resolution, and the object score logits of each tracked frame."""
         self.propagate_in_video_preflight()
-        output_dict = self.output_dict
-        batch_size = self._get_obj_num()
-        if len(output_dict["cond_frame_outputs"]) == 0:
+        if len(self.output_dict["cond_frame_outputs"]) == 0:
             raise RuntimeError("No points are provided; please add points first")
-        clear_non_cond_mem = batch_size <= 1
-
         for frame_idx in self._get_processing_order(
             start_frame_idx, max_frame_num_to_track, reverse
         ):
-            if frame_idx in self.consolidated_frame_inds:
-                storage_key = "cond_frame_outputs"
-                current_out = output_dict[storage_key][frame_idx]
-                if clear_non_cond_mem:
-                    self._clear_non_cond_mem_around_input(frame_idx)
-            else:
-                storage_key = "non_cond_frame_outputs"
-                current_out = self._track_step(
-                    frame_idx=frame_idx,
-                    is_init_cond_frame=False,
-                    point_inputs=None,
-                    mask_inputs=None,
-                    output_dict=output_dict,
-                    track_in_reverse=reverse,
-                    run_mem_encoder=True,
-                    batch_size=batch_size,
-                )
-                output_dict[storage_key][frame_idx] = current_out
-            self._add_output_per_object(frame_idx, current_out, storage_key)
-            self.frames_already_tracked[frame_idx] = {"reverse": reverse}
+            current_out = self.propagate_one_frame(frame_idx, reverse)
             yield (
                 frame_idx,
                 self.obj_ids,
                 self._get_orig_video_res_output(current_out["pred_masks"]),
                 current_out["object_score_logits"],
             )
+
+    def propagate_one_frame(
+        self, frame_idx: int, reverse: bool, run_mem_encoder: bool = True
+    ) -> FrameOutput:
+        """Track every object on one frame after propagate_in_video_preflight, as
+        a step of propagate_in_video. The output has the low-res "pred_masks"."""
+        output_dict = self.output_dict
+        if frame_idx in self.consolidated_frame_inds:
+            storage_key = "cond_frame_outputs"
+            current_out = output_dict[storage_key][frame_idx]
+            if self._get_obj_num() <= 1:
+                self._clear_non_cond_mem_around_input(frame_idx)
+        else:
+            storage_key = "non_cond_frame_outputs"
+            current_out = self._track_step(
+                frame_idx=frame_idx,
+                is_init_cond_frame=False,
+                point_inputs=None,
+                mask_inputs=None,
+                output_dict=output_dict,
+                track_in_reverse=reverse,
+                run_mem_encoder=run_mem_encoder,
+                batch_size=self._get_obj_num(),
+            )
+            output_dict[storage_key][frame_idx] = current_out
+        self._add_output_per_object(frame_idx, current_out, storage_key)
+        self.frames_already_tracked[frame_idx] = {"reverse": reverse}
+        return current_out
+
+    def update_memories(
+        self, frame_idx: int, high_res_masks: NDArray, object_score_logits: NDArray
+    ) -> None:
+        """Encode the memory of one frame from masks that the caller resolved
+        across trackers, as Sam3VideoBase._tracker_update_memories does."""
+        maskmem_features = self._encode_new_memory(
+            frame_idx,
+            high_res_masks=high_res_masks,
+            object_score_logits=object_score_logits,
+            is_mask_from_pts=False,
+        )
+        for storage_key, outputs in self.output_dict.items():
+            if frame_idx in outputs:
+                outputs[frame_idx]["maskmem_features"] = maskmem_features
+                self._add_output_per_object(frame_idx, outputs[frame_idx], storage_key)
 
     def _add_output_per_object(
         self, frame_idx: int, current_out: FrameOutput, storage_key: str
