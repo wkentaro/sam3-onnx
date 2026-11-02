@@ -42,6 +42,11 @@ def test_propagation_history() -> None:
     else:
         raise AssertionError("fetching uncached frames should raise")
 
+    # Hotstart removes an object through _tracker_remove_object.
+    video.cached_frame_outputs[0] = {7: np.ones((4, 4), np.bool_)}
+    video._tracker_remove_object(7)
+    assert video.cached_frame_outputs[0] == {}
+
 
 if __name__ == "__main__":
     test_empty_masks()

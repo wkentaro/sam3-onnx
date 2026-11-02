@@ -584,8 +584,6 @@ class VideoInference:
         self._add_action_history("remove", None, [obj_id])
         self.obj_ids = self.obj_ids[self.obj_ids != obj_id]
         self.obj_id_to_score.pop(obj_id, None)
-        for frame_cache in self.cached_frame_outputs.values():
-            frame_cache.pop(obj_id, None)
 
     def add_tracker_new_points(
         self, frame_idx: int, obj_id: int, points: NDArray, labels: NDArray
@@ -981,5 +979,9 @@ class VideoInference:
         for tracker in self.trackers:
             tracker.remove_object(obj_id)
         self.trackers = [tracker for tracker in self.trackers if tracker.obj_ids]
+        # Unlike upstream, which does this only in remove_object, also drop the
+        # objects that hotstart removes from the frames cached before.
+        for frame_cache in self.cached_frame_outputs.values():
+            frame_cache.pop(obj_id, None)
 
     # }}
