@@ -1,5 +1,6 @@
 import numpy as np
 
+from track_onnx import _resize
 from video_onnx import _mask_iou
 from video_onnx import _nms_masks
 
@@ -10,6 +11,7 @@ def test_empty_masks() -> None:
     assert _mask_iou(empty > 0, masks > 0).shape == (0, 2)
     assert _mask_iou(masks > 0, empty > 0).shape == (2, 0)
     assert _nms_masks(np.zeros(0, np.float32), empty, 0.1).tolist() == []
+    assert _resize(empty[:, None], 8, 6).shape == (0, 1, 8, 6)
 
 
 def test_nms_masks() -> None:
