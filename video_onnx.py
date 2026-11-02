@@ -476,10 +476,14 @@ class VideoInference:
         processing_order, _ = self._get_processing_order(
             start_frame_idx, max_frame_num_to_track, reverse
         )
-        # Unlike upstream, which outputs nothing on frames that no propagation
-        # has reached, as after a limited one, track them.
-        if not self.cached_frame_outputs.keys() >= set(processing_order):
-            propagation_type, obj_ids = "propagation_full", None
+        uncached = [i for i in processing_order if i not in self.cached_frame_outputs]
+        if propagation_type != "propagation_full" and uncached:
+            # Upstream returns these frames empty, or fails on a KeyError.
+            raise RuntimeError(
+                f"frames {min(uncached)} to {max(uncached)} have no outputs, as "
+                "only the first two propagations after a text or box prompt "
+                "run detection; prompt again to propagate them"
+            )
         self._add_action_history(propagation_type, start_frame_idx, obj_ids)
         if propagation_type == "propagation_full":
             yield from self._propagate_full(
@@ -546,7 +550,9 @@ class VideoInference:
         object, "propagation_partial" with the objects to track, or
         "propagation_fetch" for the cached outputs."""
         action_history = self.action_history
-        if not action_history:
+        # Unlike upstream, which checks for an empty history, also run it after
+        # removing objects before the first propagation.
+        if not any(a["type"].startswith("propagation") for a in action_history):
             return "propagation_full", None
         last = action_history[-1]
         if last["type"] == "propagation_fetch":
@@ -639,11 +645,10 @@ class VideoInference:
             <= REFINEMENT_DETECTOR_COND_FRAME_REMOVAL_WINDOW
         ]
         for frame_idx in mask_only_cond_frame_indices:
-            for obj_id2, obj_idx2 in list(tracker.obj_id_to_idx.items()):
-                # Unlike upstream, keep the points that the user put on
-                # another object there.
-                if frame_idx not in tracker.point_inputs_per_obj[obj_idx2]:
-                    tracker.clear_all_points_in_frame(frame_idx, obj_id2)
+            # This also clears the points of other objects on that frame, as
+            # upstream does.
+            for obj_id2 in list(tracker.obj_ids):
+                tracker.clear_all_points_in_frame(frame_idx, obj_id2)
 
     # }}
 

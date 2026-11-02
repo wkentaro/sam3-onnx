@@ -1,6 +1,7 @@
 import numpy as np
 
 from track_onnx import _resize
+from video_onnx import VideoInference
 from video_onnx import _mask_iou
 from video_onnx import _nms_masks
 
@@ -22,7 +23,28 @@ def test_nms_masks() -> None:
     assert _nms_masks(probs, masks, 0.1).tolist() == [1, 2]
 
 
+def test_propagation_history() -> None:
+    video = object.__new__(VideoInference)
+    video.num_frames, video.video_height, video.video_width = 10, 4, 4
+    video.reset_state()
+    video.frames_with_outputs.add(0)
+    video._add_action_history("remove", None, [0])
+    assert video._parse_action_history_for_propagation() == ("propagation_full", None)
+
+    # A propagation from frame 0 that stopped at frame 4
+    video._add_action_history("propagation_full", 0, None)
+    video.cached_frame_outputs.update({i: {} for i in range(5)})
+    assert len(list(video.propagate_in_video(max_frame_num_to_track=4))) == 5
+    try:
+        next(video.propagate_in_video(start_frame_idx=5))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("fetching uncached frames should raise")
+
+
 if __name__ == "__main__":
     test_empty_masks()
     test_nms_masks()
+    test_propagation_history()
     print("ok")
