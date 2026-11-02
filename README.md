@@ -107,6 +107,18 @@ uv run infer_onnx.py --image images/bus.jpg --point-prompt 0.18,0.55
 uv run infer_onnx.py --image images/bus.jpg --point-prompt 0.18,0.55 --point-prompt 0.2,0.7 --single-mask  # one mask, for several points
 ```
 
+**Video tracking with onnx**
+
+```sh
+# track the object at a point or box on --frame-idx through the video, both ways
+uv run infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --point-prompt 0.22,0.65 --output /tmp/bedroom.mp4
+uv run infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --box-prompt 0.417,0.37,0.208,0.741 --output /tmp/bedroom.mp4
+```
+
+`track_onnx.Tracker` ports SAM3's video tracker (`Sam3TrackerPredictor`) to numpy on top of four models: `sam3_point_decoder.onnx`, `sam3_memory_encoder.onnx`, `sam3_memory_attention.onnx`, and `sam3_mask_downsampler.onnx`. It takes point, box, and mask prompts for several objects, refinement clicks on any frame, forward and reverse propagation, and object removal, with the same method names as the PyTorch predictor.
+
+The v0.6.0 models predate video tracking. Create the tracker models and the updated point decoder with `uv run export_onnx.py`.
+
 **Inference with onnx on GPU**
 
 ```sh
