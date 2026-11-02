@@ -133,6 +133,14 @@ uv run test_text_parity.py --apple-image /path/to/apple.jpg
 
 The check compares preprocessing, image and language features, and decoder scores for apples and `images/bus.jpg` with "person". It also feeds PyTorch features to the ONNX decoder to isolate decoder errors. Both pipelines must return the same detection count and sorted scores within 0.01. PIL bilinear resizing can differ from PyTorch's tensor resize by one uint8 level. This inference fix works with the existing models; no re-export or Hugging Face upload is needed.
 
+**Check video tracking against PyTorch on CUDA**
+
+```sh
+uv run test_video_parity.py
+```
+
+The check runs point, refinement, reverse, box, mask, two-object, and removal cases on the first 60 frames of `bedroom.mp4` with the PyTorch tracker in float32, and fails if a frame's mask IoU drops below 0.99.
+
 ## Pre-exported ONNX models
 
 If don't want to export yourself, download them from the [Hugging Face repo](https://huggingface.co/wkentaro/sam3-onnx-models-v0.6.0):
