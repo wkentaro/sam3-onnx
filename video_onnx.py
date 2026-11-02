@@ -473,6 +473,13 @@ class VideoInference:
         the earlier outputs, or return the earlier outputs when there are none.
         """
         propagation_type, obj_ids = self._parse_action_history_for_propagation()
+        processing_order, _ = self._get_processing_order(
+            start_frame_idx, max_frame_num_to_track, reverse
+        )
+        # Unlike upstream, which outputs nothing on frames that no propagation
+        # has reached, as after a limited one, track them.
+        if not self.cached_frame_outputs.keys() >= set(processing_order):
+            propagation_type, obj_ids = "propagation_full", None
         self._add_action_history(propagation_type, start_frame_idx, obj_ids)
         if propagation_type == "propagation_full":
             yield from self._propagate_full(
@@ -480,12 +487,9 @@ class VideoInference:
             )
             return
 
-        processing_order, _ = self._get_processing_order(
-            start_frame_idx, max_frame_num_to_track, reverse
-        )
         if propagation_type == "propagation_fetch":
             for frame_idx in processing_order:
-                obj_id_to_mask = self.cached_frame_outputs.get(frame_idx, {})
+                obj_id_to_mask = self.cached_frame_outputs[frame_idx]
                 yield (
                     frame_idx,
                     self._postprocess_output(
