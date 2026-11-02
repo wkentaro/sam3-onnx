@@ -206,7 +206,7 @@ class _Decoder(torch.nn.Module):
         box_coords: torch.Tensor,
         box_labels: torch.Tensor,
         box_masks: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         geometric_prompt = self._processor.model._get_dummy_prompt()
         geometric_prompt.box_embeddings = box_coords
         geometric_prompt.box_labels = box_labels
@@ -252,9 +252,10 @@ class _Decoder(torch.nn.Module):
         )
 
         # masks at model native resolution (no interpolation to original image size)
-        masks = out_masks.unsqueeze(1).sigmoid()
+        mask_logits = out_masks.unsqueeze(1)
 
-        return boxes, out_probs, masks
+        # The video predictor resizes and fills holes in the logits.
+        return boxes, out_probs, mask_logits.sigmoid(), mask_logits
 
 
 def _export_decoder(
@@ -272,12 +273,23 @@ def _export_decoder(
     box_masks: NDArray,
 ) -> list[NDArray]:
     onnx_file: pathlib.Path = pathlib.Path("models/sam3_decoder.onnx")
-    # v0.4.0 and earlier decoders take one box.
-    if onnx_file.exists() and [
-        i.type.tensor_type.shape.dim[0].dim_value
-        for i in onnx.load(onnx_file, load_external_data=False).graph.input
-        if i.name == "box_coords"
-    ] == [len(box_coords)]:
+    graph = (
+        onnx.load(onnx_file, load_external_data=False).graph
+        if onnx_file.exists()
+        else None
+    )
+    # v0.4.0 and earlier decoders take one box, and v0.6.0 and earlier lack
+    # the mask logits for video.
+    if (
+        graph is not None
+        and [
+            i.type.tensor_type.shape.dim[0].dim_value
+            for i in graph.input
+            if i.name == "box_coords"
+        ]
+        == [len(box_coords)]
+        and "mask_logits" in [o.name for o in graph.output]
+    ):
         logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
     else:
         logger.debug("exporting onnx model: {!r}", str(onnx_file))
@@ -314,7 +326,7 @@ def _export_decoder(
                 "box_labels",
                 "box_masks",
             ],
-            output_names=["boxes", "scores", "masks"],
+            output_names=["boxes", "scores", "masks", "mask_logits"],
             opset_version=21,
             dynamo=False,
             verify=True,
@@ -324,7 +336,7 @@ def _export_decoder(
 
     session = onnxruntime.InferenceSession(onnx_file)
     output = session.run(
-        None,
+        ["boxes", "scores", "masks"],
         {
             "vision_pos_enc_2": vision_pos_enc_2,
             "backbone_fpn_0": backbone_fpn_0,
@@ -474,7 +486,6 @@ class _MemoryEncoder(torch.nn.Module):
         )
         self._sigmoid_scale: float = tracker.sigmoid_scale_for_mem_enc
         self._sigmoid_bias: float = tracker.sigmoid_bias_for_mem_enc
-        self._image_size: int = tracker.image_size
 
     def forward(
         self,
@@ -486,13 +497,8 @@ class _MemoryEncoder(torch.nn.Module):
     ) -> torch.Tensor:
         # The image encoder adds no_mem_embed for the point decoder.
         pix_feat = image_embeddings - self._no_mem_embed.view(1, -1, 1, 1)
-        # pred_masks_high_res, as Sam3TrackerBase._forward_sam_heads upsamples it.
-        mask_logits = torch.nn.functional.interpolate(
-            mask_logits,
-            size=(self._image_size, self._image_size),
-            mode="bilinear",
-            align_corners=False,
-        )
+        # mask_logits is pred_masks_high_res, at 1008 as _forward_sam_heads
+        # upsamples it, or at 1152 as Sam3VideoBase._tracker_update_memories does.
         # Sam3TrackerBase._apply_non_overlapping_constraints, which
         # Sam3TrackerPredictor applies to the frames with prompts.
         is_max = mask_logits.argmax(dim=0, keepdim=True) == torch.arange(
@@ -506,7 +512,8 @@ class _MemoryEncoder(torch.nn.Module):
         )
         mask_for_mem = mask_for_mem * self._sigmoid_scale + self._sigmoid_bias
         # SimpleMaskEncoder.forward with skip_mask_sigmoid. Its downsampler
-        # upsamples with antialias, which ONNX lacks and which upsampling ignores.
+        # upsamples with antialias, which ONNX lacks and which upsampling ignores,
+        # to 1152, where resizing does nothing.
         backbone = self._maskmem_backbone
         mask_for_mem = torch.nn.functional.interpolate(
             mask_for_mem,
@@ -681,7 +688,14 @@ def _export_tracker_models(
         dynamic_axes: dict[str, dict[int, str]] | None = None,
     ) -> None:
         onnx_file = pathlib.Path(f"models/sam3_{name}.onnx")
-        if onnx_file.exists():
+        # Re-export a model that lacks a dynamic axis, like the memory encoder
+        # before video, which took low-res masks of a fixed size.
+        if onnx_file.exists() and not any(
+            dims[axis].dim_value
+            for i in onnx.load(onnx_file, load_external_data=False).graph.input
+            for dims in [i.type.tensor_type.shape.dim]
+            for axis in (dynamic_axes or {}).get(i.name, {})
+        ):
             logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
             return
         logger.debug("exporting onnx model: {!r}", str(onnx_file))
@@ -704,14 +718,14 @@ def _export_tracker_models(
         lambda: _MemoryEncoder(model=model),
         inputs={
             "image_embeddings": image_embeddings,
-            "mask_logits": rng.normal(size=(2, 1, 288, 288)).astype(np.float32),
+            "mask_logits": rng.normal(size=(2, 1, 1008, 1008)).astype(np.float32),
             "is_mask_from_pts": np.array([1], dtype=np.float32),
             "object_score_logits": np.array([[1], [-1]], dtype=np.float32),
             "non_overlapping": np.array([1], dtype=np.float32),
         },
         output_names=["maskmem_features"],
         dynamic_axes={
-            "mask_logits": {0: "num_objects"},
+            "mask_logits": {0: "num_objects", 2: "height", 3: "width"},
             "object_score_logits": {0: "num_objects"},
             "maskmem_features": {0: "num_objects"},
         },
