@@ -635,8 +635,11 @@ class VideoInference:
             <= REFINEMENT_DETECTOR_COND_FRAME_REMOVAL_WINDOW
         ]
         for frame_idx in mask_only_cond_frame_indices:
-            for obj_id2 in list(tracker.obj_ids):
-                tracker.clear_all_points_in_frame(frame_idx, obj_id2)
+            for obj_id2, obj_idx2 in list(tracker.obj_id_to_idx.items()):
+                # Unlike upstream, keep the points that the user put on
+                # another object there.
+                if frame_idx not in tracker.point_inputs_per_obj[obj_idx2]:
+                    tracker.clear_all_points_in_frame(frame_idx, obj_id2)
 
     # }}
 
