@@ -361,8 +361,8 @@ class _PointDecoder(torch.nn.Module):
         point_labels: torch.Tensor,
         mask_input: torch.Tensor,
         has_mask_input: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # SAM3InteractiveImagePredictor._predict with multimask_output=True
+    ) -> tuple[torch.Tensor, ...]:
+        # SAM3InteractiveImagePredictor._predict with both values of multimask_output
         prompt_encoder = self._prompt_encoder
         sparse_embeddings, dense_embeddings = prompt_encoder(
             points=(point_coords, point_labels), boxes=None, masks=None
@@ -371,24 +371,32 @@ class _PointDecoder(torch.nn.Module):
             has_mask_input * prompt_encoder._embed_masks(mask_input)
             + (1 - has_mask_input) * dense_embeddings
         )
-        low_res_masks, iou_predictions, _, _ = self._mask_decoder(
+        # All 4 mask tokens, which MaskDecoder.forward splits by multimask_output.
+        all_masks, all_iou, _, _ = self._mask_decoder.predict_masks(
             image_embeddings=image_embeddings,
             image_pe=prompt_encoder.get_dense_pe(),
             sparse_prompt_embeddings=sparse_embeddings,
             dense_prompt_embeddings=dense_embeddings,
-            multimask_output=True,
             repeat_image=False,
             high_res_features=[high_res_features1, high_res_features2],
         )
         # As SAM3InteractiveImagePredictor._predict, so they can be fed back.
-        return iou_predictions, low_res_masks.clamp(-32.0, 32.0)
+        all_masks = all_masks.clamp(-32.0, 32.0)
+        assert self._mask_decoder.dynamic_multimask_via_stability
+        single_masks, single_iou = self._mask_decoder._dynamic_multimask_via_stability(
+            all_masks, all_iou
+        )
+        return all_iou[:, 1:], all_masks[:, 1:], single_iou, single_masks
 
 
 def _export_point_decoder(
     model: Sam3Image, sam2_features: list[NDArray]
 ) -> onnxruntime.InferenceSession:
     onnx_file: pathlib.Path = pathlib.Path("models/sam3_point_decoder.onnx")
-    if onnx_file.exists():
+    # v0.6.0 and earlier decoders lack the single-mask outputs.
+    if onnx_file.exists() and "single_low_res_masks" in [
+        o.name for o in onnx.load(onnx_file, load_external_data=False).graph.output
+    ]:
         logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
     else:
         inputs: dict[str, NDArray] = {
@@ -406,7 +414,12 @@ def _export_point_decoder(
             args=tuple(torch.tensor(v) for v in inputs.values()),
             f=onnx_file,
             input_names=list(inputs),
-            output_names=["iou_predictions", "low_res_masks"],
+            output_names=[
+                "iou_predictions",
+                "low_res_masks",
+                "single_iou_predictions",
+                "single_low_res_masks",
+            ],
             dynamic_axes={
                 "point_coords": {1: "num_points"},
                 "point_labels": {1: "num_points"},
@@ -534,27 +547,33 @@ def main():
 
     best_box: NDArray = boxes[scores.argmax()]
     point: NDArray = (best_box[:2] + best_box[2:]) / 2
-    iou_predictions, low_res_masks = run_point_decoder(
-        sess_point_decode=_export_point_decoder(model, sam2_features),
-        sam2_features=sam2_features,
-        point_prompt=[[point[0] / image.width, point[1] / image.height, 1]],
-    )
-    # }}
-
+    sess_point_decode = _export_point_decoder(model, sam2_features)
     state = processor.set_image(image)
-    kwargs = dict(
-        point_coords=point[None], point_labels=np.array([1]), multimask_output=True
-    )
-    _, iou_torch, low_res_torch = model.predict_inst(state, **kwargs)
-    _, iou_torch, low_res_torch = model.predict_inst(
-        state, mask_input=low_res_torch[[iou_torch.argmax()]], **kwargs
-    )
-    logger.debug(
-        "point decoder vs pytorch: iou_predictions {} vs {}, mask agreement {:.3f}",
-        iou_predictions[0].round(3),
-        iou_torch.round(3),
-        ((low_res_masks[0] > 0) == (low_res_torch > 0)).mean(),
-    )
+    for multimask_output in [True, False]:
+        iou_predictions, low_res_masks = run_point_decoder(
+            sess_point_decode=sess_point_decode,
+            sam2_features=sam2_features,
+            point_prompt=[[point[0] / image.width, point[1] / image.height, 1]],
+            multimask_output=multimask_output,
+        )
+        kwargs = dict(
+            point_coords=point[None],
+            point_labels=np.array([1]),
+            multimask_output=multimask_output,
+        )
+        _, iou_torch, low_res_torch = model.predict_inst(state, **kwargs)
+        _, iou_torch, low_res_torch = model.predict_inst(
+            state, mask_input=low_res_torch[[iou_torch.argmax()]], **kwargs
+        )
+        logger.debug(
+            "point decoder vs pytorch (multimask_output={}): "
+            "iou_predictions {} vs {}, mask agreement {:.3f}",
+            multimask_output,
+            iou_predictions[0].round(3),
+            iou_torch.round(3),
+            ((low_res_masks[0] > 0) == (low_res_torch > 0)).mean(),
+        )
+    # }}
 
     mask, score = postprocess_point_decoder_output(
         iou_predictions=iou_predictions,

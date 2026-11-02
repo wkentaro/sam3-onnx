@@ -41,6 +41,7 @@ uv run infer_torch.py --image images/bus.jpg --text-prompt person --box-prompt 0
 
 # with point prompt: x,y[,label] (normalized, label 0 for background), repeatable
 uv run infer_torch.py --image images/bus.jpg --point-prompt 0.18,0.55
+uv run infer_torch.py --image images/bus.jpg --point-prompt 0.18,0.55 --point-prompt 0.2,0.7 --single-mask  # one mask, for several points
 ```
 
 **Export to onnx**
@@ -103,6 +104,7 @@ uv run infer_onnx.py --image images/bus.jpg --text-prompt person --box-prompt 0.
 
 # with point prompt: x,y[,label] (normalized, label 0 for background), repeatable
 uv run infer_onnx.py --image images/bus.jpg --point-prompt 0.18,0.55
+uv run infer_onnx.py --image images/bus.jpg --point-prompt 0.18,0.55 --point-prompt 0.2,0.7 --single-mask  # one mask, for several points
 ```
 
 **Inference with onnx on GPU**

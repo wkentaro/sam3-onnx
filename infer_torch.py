@@ -49,7 +49,7 @@ def main() -> None:
         kwargs = dict(
             point_coords=points[:, :2] * [image.width, image.height],
             point_labels=points[:, 2],
-            multimask_output=True,
+            multimask_output=not args.single_mask,
         )
         _, scores, low_res_masks = model.predict_inst(state, **kwargs)
         # Refine with the best mask from the first pass as the mask prompt.

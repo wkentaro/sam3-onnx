@@ -46,6 +46,7 @@ def test_parse_box_prompt() -> None:
         ["--box-prompt", "0.1,0.2,0.3,0.4,0.5"],
         ["--box-prompt", "0.1,0.2,0.3"],
         ["--box-prompt", "0.1,0.2,0.3,0.4", "--point-prompt", "0.1,0.2"],
+        ["--text-prompt", "person", "--single-mask"],
     ]:
         try:
             _parse(*argv)
