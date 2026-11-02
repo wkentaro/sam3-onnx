@@ -16,6 +16,7 @@ from numpy.typing import NDArray
 from osam._models.yoloworld.clip import tokenize
 from sam3.model.sam3_image import Sam3Image  # type: ignore[unresolved-import]
 from sam3.model.sam3_image_processor import Sam3Processor  # type: ignore[unresolved-import]
+from sam3.model.sam3_tracker_utils import get_1d_sine_pe  # type: ignore[unresolved-import]
 from sam3.model_builder import build_sam3_image_model  # type: ignore[unresolved-import]
 from torchvision.transforms import v2
 
@@ -351,6 +352,8 @@ class _PointDecoder(torch.nn.Module):
         # index on the CPU, so export this small decoder on the CPU.
         self._prompt_encoder = copy.deepcopy(tracker.sam_prompt_encoder).cpu()
         self._mask_decoder = copy.deepcopy(tracker.sam_mask_decoder).cpu()
+        self._obj_ptr_proj = copy.deepcopy(tracker.obj_ptr_proj).cpu()
+        self.register_buffer("_no_obj_ptr", tracker.no_obj_ptr.detach().cpu())
 
     def forward(
         self,
@@ -372,13 +375,22 @@ class _PointDecoder(torch.nn.Module):
             + (1 - has_mask_input) * dense_embeddings
         )
         # All 4 mask tokens, which MaskDecoder.forward splits by multimask_output.
-        all_masks, all_iou, _, _ = self._mask_decoder.predict_masks(
-            image_embeddings=image_embeddings,
-            image_pe=prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            repeat_image=False,
-            high_res_features=[high_res_features1, high_res_features2],
+        all_masks, all_iou, mask_tokens, object_score_logits = (
+            self._mask_decoder.predict_masks(
+                image_embeddings=image_embeddings,
+                image_pe=prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                repeat_image=False,
+                high_res_features=[high_res_features1, high_res_features2],
+            )
+        )
+        # Sam3TrackerBase._forward_sam_heads, for every mask token: the tracker
+        # takes the single mask's pointer, or the best of the multimask ones.
+        is_obj_appearing = (object_score_logits > 0).float()[:, :, None]
+        obj_ptrs = (
+            is_obj_appearing * self._obj_ptr_proj(mask_tokens)
+            + (1 - is_obj_appearing) * self._no_obj_ptr
         )
         # As SAM3InteractiveImagePredictor._predict, so they can be fed back.
         all_masks = all_masks.clamp(-32.0, 32.0)
@@ -386,15 +398,23 @@ class _PointDecoder(torch.nn.Module):
         single_masks, single_iou = self._mask_decoder._dynamic_multimask_via_stability(
             all_masks, all_iou
         )
-        return all_iou[:, 1:], all_masks[:, 1:], single_iou, single_masks
+        return (
+            all_iou[:, 1:],
+            all_masks[:, 1:],
+            single_iou,
+            single_masks,
+            object_score_logits,
+            obj_ptrs[:, 1:],
+            obj_ptrs[:, 0],
+        )
 
 
 def _export_point_decoder(
     model: Sam3Image, sam2_features: list[NDArray]
 ) -> onnxruntime.InferenceSession:
     onnx_file: pathlib.Path = pathlib.Path("models/sam3_point_decoder.onnx")
-    # v0.6.0 and earlier decoders lack the single-mask outputs.
-    if onnx_file.exists() and "single_low_res_masks" in [
+    # Earlier decoders lack the outputs for tracking.
+    if onnx_file.exists() and "single_obj_ptr" in [
         o.name for o in onnx.load(onnx_file, load_external_data=False).graph.output
     ]:
         logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
@@ -419,6 +439,9 @@ def _export_point_decoder(
                 "low_res_masks",
                 "single_iou_predictions",
                 "single_low_res_masks",
+                "object_score_logits",
+                "obj_ptrs",
+                "single_obj_ptr",
             ],
             dynamic_axes={
                 "point_coords": {1: "num_points"},
@@ -432,6 +455,294 @@ def _export_point_decoder(
         _postprocess(onnx_file)
 
     return onnxruntime.InferenceSession(onnx_file)
+
+
+class _MemoryEncoder(torch.nn.Module):
+    """Sam3TrackerBase._encode_new_memory for one frame of a batch of objects."""
+
+    _maskmem_backbone: typing.Any
+    _no_mem_embed: torch.Tensor
+    _no_obj_embed_spatial: torch.Tensor
+
+    def __init__(self, model: Sam3Image) -> None:
+        super().__init__()
+        tracker = model.inst_interactive_predictor.model
+        self._maskmem_backbone = copy.deepcopy(tracker.maskmem_backbone).cpu()
+        self.register_buffer("_no_mem_embed", tracker.no_mem_embed.detach().cpu())
+        self.register_buffer(
+            "_no_obj_embed_spatial", tracker.no_obj_embed_spatial.detach().cpu()
+        )
+        self._sigmoid_scale: float = tracker.sigmoid_scale_for_mem_enc
+        self._sigmoid_bias: float = tracker.sigmoid_bias_for_mem_enc
+        self._image_size: int = tracker.image_size
+
+    def forward(
+        self,
+        image_embeddings: torch.Tensor,
+        mask_logits: torch.Tensor,
+        is_mask_from_pts: torch.Tensor,
+        object_score_logits: torch.Tensor,
+        non_overlapping: torch.Tensor,
+    ) -> torch.Tensor:
+        # The image encoder adds no_mem_embed for the point decoder.
+        pix_feat = image_embeddings - self._no_mem_embed.view(1, -1, 1, 1)
+        # pred_masks_high_res, as Sam3TrackerBase._forward_sam_heads upsamples it.
+        mask_logits = torch.nn.functional.interpolate(
+            mask_logits,
+            size=(self._image_size, self._image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        # Sam3TrackerBase._apply_non_overlapping_constraints, which
+        # Sam3TrackerPredictor applies to the frames with prompts.
+        is_max = mask_logits.argmax(dim=0, keepdim=True) == torch.arange(
+            mask_logits.shape[0]
+        ).view(-1, 1, 1, 1)
+        mask_logits = torch.where(
+            (non_overlapping > 0) & ~is_max, mask_logits.clamp(max=-10.0), mask_logits
+        )
+        mask_for_mem = torch.where(
+            is_mask_from_pts > 0, (mask_logits > 0).float(), mask_logits.sigmoid()
+        )
+        mask_for_mem = mask_for_mem * self._sigmoid_scale + self._sigmoid_bias
+        # SimpleMaskEncoder.forward with skip_mask_sigmoid. Its downsampler
+        # upsamples with antialias, which ONNX lacks and which upsampling ignores.
+        backbone = self._maskmem_backbone
+        mask_for_mem = torch.nn.functional.interpolate(
+            mask_for_mem,
+            size=backbone.mask_downsampler.interpol_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        x = backbone.pix_feat_proj(pix_feat)
+        x = x + backbone.mask_downsampler.encoder(mask_for_mem)
+        maskmem_features = backbone.out_proj(backbone.fuser(x))
+        is_obj_appearing = (object_score_logits > 0).float()[..., None, None]
+        return (
+            maskmem_features
+            + (1 - is_obj_appearing) * self._no_obj_embed_spatial[..., None, None]
+        )
+
+
+class _MaskDownsampler(torch.nn.Module):
+    """The mask prompt of Sam3TrackerBase._use_mask_as_output."""
+
+    _no_mem_embed: torch.Tensor
+    _no_obj_ptr: torch.Tensor
+
+    def __init__(self, model: Sam3Image) -> None:
+        super().__init__()
+        tracker = model.inst_interactive_predictor.model
+        self._mask_downsample = copy.deepcopy(tracker.mask_downsample).cpu()
+        self.register_buffer("_no_mem_embed", tracker.no_mem_embed.detach().cpu())
+        self.register_buffer("_no_obj_ptr", tracker.no_obj_ptr.detach().cpu())
+
+    def forward(
+        self, image_embeddings: torch.Tensor, mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # The point decoder takes the features without no_mem_embed here.
+        image_features = image_embeddings - self._no_mem_embed.view(1, -1, 1, 1)
+        # The pointer of an empty mask, as _use_mask_as_output gives.
+        return image_features, self._mask_downsample(mask), self._no_obj_ptr
+
+
+def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """sam3.sam.rope.apply_rotary_enc in real numbers, repeated along x's tokens."""
+    shape = x.shape
+    x = x.reshape(shape[0], shape[1], -1, cos.shape[0], cos.shape[1], 2)
+    x_real, x_imag = x[..., 0], x[..., 1]
+    x = torch.stack([x_real * cos - x_imag * sin, x_real * sin + x_imag * cos], -1)
+    return x.reshape(shape)
+
+
+class _MemoryAttention(torch.nn.Module):
+    """Sam3TrackerBase._prepare_memory_conditioned_features after the memory
+    selection, which stays outside the model.
+
+    It takes n spatial memories and p object pointers, whose counts vary per
+    frame. RoPE applies to the spatial memories only, as num_obj_ptr_tokens
+    does in TransformerEncoderCrossAttention.
+    """
+
+    _encoder: typing.Any
+    _obj_ptr_tpos_proj: typing.Any
+    _no_mem_embed: torch.Tensor
+    _maskmem_tpos_enc: torch.Tensor
+    _src_pos: torch.Tensor
+    _maskmem_pos: torch.Tensor
+    _cos: torch.Tensor
+    _sin: torch.Tensor
+
+    def __init__(self, model: Sam3Image, vision_pos_enc: NDArray) -> None:
+        super().__init__()
+        tracker = model.inst_interactive_predictor.model
+        self._encoder = copy.deepcopy(tracker.transformer.encoder).cpu()
+        self.register_buffer("_no_mem_embed", tracker.no_mem_embed.detach().cpu())
+        self.register_buffer(
+            "_maskmem_tpos_enc", tracker.maskmem_tpos_enc.detach().cpu()
+        )
+        self._obj_ptr_tpos_proj = copy.deepcopy(tracker.obj_ptr_tpos_proj).cpu()
+        self._mem_dim: int = tracker.mem_dim
+        # Position encodings depend on the feature size alone. The tracker's
+        # image features share their position encoding with the detector's.
+        self.register_buffer(
+            "_src_pos", torch.from_numpy(vision_pos_enc).flatten(2).transpose(1, 2)
+        )
+        maskmem_pos = tracker.maskmem_backbone.position_encoding(
+            torch.zeros(1, self._mem_dim, *vision_pos_enc.shape[-2:])
+        )
+        self.register_buffer("_maskmem_pos", maskmem_pos.flatten(2).transpose(1, 2))
+        # As get_replace_freqs_cis replaced RoPEAttention.freqs_cis.
+        self_attn = self._encoder.layers[0].self_attn
+        self.register_buffer("_cos", self_attn.freqs_cos.cpu())
+        self.register_buffer("_sin", self_attn.freqs_sin.cpu())
+
+    def _attention(
+        self,
+        attention: typing.Any,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        num_k_rope: int | torch.Tensor,
+    ) -> torch.Tensor:
+        """RoPEAttention.forward for one head, with num_k_rope traced."""
+        q = _rope(attention.q_proj(q)[:, None], self._cos, self._sin)
+        k = attention.k_proj(k)[:, None]
+        k = torch.cat(
+            [_rope(k[:, :, :num_k_rope], self._cos, self._sin), k[:, :, num_k_rope:]],
+            dim=2,
+        )
+        v = attention.v_proj(v)[:, None]
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        return attention.out_proj(out[:, 0])
+
+    def forward(
+        self,
+        image_embeddings: torch.Tensor,
+        memory: torch.Tensor,
+        memory_tpos: torch.Tensor,
+        obj_ptrs: torch.Tensor,
+        obj_ptr_tpos: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, channels, height, width = image_embeddings.shape
+        pix_feat = image_embeddings - self._no_mem_embed.view(1, -1, 1, 1)
+        src = pix_feat.flatten(2).transpose(1, 2)
+
+        # Each spatial memory with its temporal position encoding.
+        num_k_rope = memory.shape[0] * memory.shape[2] * memory.shape[3]
+        prompt_memory = memory.flatten(2).transpose(1, 2).reshape(1, -1, self._mem_dim)
+        prompt_memory_pos = (
+            self._maskmem_pos
+            + self._maskmem_tpos_enc[memory_tpos].view(-1, 1, self._mem_dim)
+        ).reshape(1, -1, self._mem_dim)
+
+        # Each object pointer splits into channels // mem_dim tokens.
+        split = channels // self._mem_dim
+        prompt_ptrs = obj_ptrs.reshape(1, -1, self._mem_dim)
+        ptr_pos = self._obj_ptr_tpos_proj(get_1d_sine_pe(obj_ptr_tpos, dim=channels))
+        prompt_ptrs_pos = ptr_pos.repeat_interleave(split, dim=0)[None]
+
+        prompt = torch.cat([prompt_memory, prompt_ptrs], dim=1)
+        prompt_pos = torch.cat([prompt_memory_pos, prompt_ptrs_pos], dim=1)
+
+        # TransformerEncoderCrossAttention.forward with TransformerDecoderLayerv2
+        # in pre-norm, self-attention first.
+        output = src + 0.1 * self._src_pos
+        for layer in self._encoder.layers:
+            tgt = layer.norm1(output)
+            output = output + self._attention(
+                layer.self_attn, tgt, tgt, tgt, num_k_rope=tgt.shape[1]
+            )
+            tgt = layer.norm2(output)
+            output = output + self._attention(
+                layer.cross_attn_image,
+                tgt,
+                prompt + prompt_pos,
+                prompt,
+                num_k_rope=num_k_rope,
+            )
+            tgt = layer.norm3(output)
+            output = output + layer.linear2(layer.activation(layer.linear1(tgt)))
+        output = self._encoder.norm(output)
+        return output.transpose(1, 2).reshape(batch, channels, height, width)
+
+
+def _export_tracker_models(
+    model: Sam3Image, vision_pos_enc: NDArray, sam2_features: list[NDArray]
+) -> None:
+    image_embeddings: NDArray = sam2_features[0]
+    rng = np.random.default_rng(0)
+
+    def export(
+        name: str,
+        module: typing.Callable[[], torch.nn.Module],
+        inputs: dict[str, NDArray],
+        output_names: list[str],
+        dynamic_axes: dict[str, dict[int, str]] | None = None,
+    ) -> None:
+        onnx_file = pathlib.Path(f"models/sam3_{name}.onnx")
+        if onnx_file.exists():
+            logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
+            return
+        logger.debug("exporting onnx model: {!r}", str(onnx_file))
+        torch.onnx.export(
+            module(),
+            args=tuple(torch.tensor(v) for v in inputs.values()),
+            f=onnx_file,
+            input_names=list(inputs),
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=21,
+            dynamo=False,
+            verify=True,
+        )
+        logger.debug("exported onnx model: {!r}", str(onnx_file))
+        _postprocess(onnx_file)
+
+    export(
+        "memory_encoder",
+        lambda: _MemoryEncoder(model=model),
+        inputs={
+            "image_embeddings": image_embeddings,
+            "mask_logits": rng.normal(size=(2, 1, 288, 288)).astype(np.float32),
+            "is_mask_from_pts": np.array([1], dtype=np.float32),
+            "object_score_logits": np.array([[1], [-1]], dtype=np.float32),
+            "non_overlapping": np.array([1], dtype=np.float32),
+        },
+        output_names=["maskmem_features"],
+        dynamic_axes={
+            "mask_logits": {0: "num_objects"},
+            "object_score_logits": {0: "num_objects"},
+            "maskmem_features": {0: "num_objects"},
+        },
+    )
+    export(
+        "memory_attention",
+        lambda: _MemoryAttention(model=model, vision_pos_enc=vision_pos_enc),
+        inputs={
+            "image_embeddings": image_embeddings,
+            "memory": rng.normal(size=(2, 64, 72, 72)).astype(np.float32),
+            "memory_tpos": np.array([6, 5], dtype=np.int64),
+            "obj_ptrs": rng.normal(size=(3, 256)).astype(np.float32),
+            "obj_ptr_tpos": np.array([0, 1 / 15, 2 / 15], dtype=np.float32),
+        },
+        output_names=["pix_feat_with_mem"],
+        dynamic_axes={
+            "memory": {0: "num_memories"},
+            "memory_tpos": {0: "num_memories"},
+            "obj_ptrs": {0: "num_ptrs"},
+            "obj_ptr_tpos": {0: "num_ptrs"},
+        },
+    )
+    export(
+        "mask_downsampler",
+        lambda: _MaskDownsampler(model=model),
+        inputs={
+            "image_embeddings": image_embeddings,
+            "mask": (rng.random((1, 1, 1152, 1152)) > 0.5).astype(np.float32),
+        },
+        output_names=["image_features", "mask_input", "no_obj_ptr"],
+    )
 
 
 def _export_litetext_language_encoder(
@@ -573,6 +884,11 @@ def main():
             iou_torch.round(3),
             ((low_res_masks[0] > 0) == (low_res_torch > 0)).mean(),
         )
+    # }}
+
+    # memory_encoder, memory_attention, mask_downsampler {{
+    # Sam3TrackerBase.track_step, with the point decoder as its SAM heads
+    _export_tracker_models(model, vision_pos_enc[2], sam2_features)
     # }}
 
     mask, score = postprocess_point_decoder_output(
