@@ -110,14 +110,18 @@ uv run infer_onnx.py --image images/bus.jpg --point-prompt 0.18,0.55 --point-pro
 **Video tracking with onnx**
 
 ```sh
+# find and track every person from --frame-idx through the video, both ways
+uv run infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --text-prompt person --output /tmp/bedroom.mp4
 # track the object at a point or box on --frame-idx through the video, both ways
 uv run infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --point-prompt 0.22,0.65 --output /tmp/bedroom.mp4
 uv run infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --box-prompt 0.417,0.37,0.208,0.741 --output /tmp/bedroom.mp4
 ```
 
+`video_onnx.VideoInference` ports SAM3's video predictor (`Sam3VideoInferenceWithInstanceInteractivity`). A text prompt finds the objects on every frame with `sam3_decoder.onnx`, and a `Tracker` tracks each one. Points then refine an object or add one, and `remove_object` drops one.
+
 `track_onnx.Tracker` ports SAM3's video tracker (`Sam3TrackerPredictor`) to numpy on top of four models: `sam3_point_decoder.onnx`, `sam3_memory_encoder.onnx`, `sam3_memory_attention.onnx`, and `sam3_mask_downsampler.onnx`. It takes point, box, and mask prompts for several objects, refinement clicks on any frame, forward and reverse propagation, and object removal, with the same method names as the PyTorch predictor.
 
-The v0.6.0 models predate video tracking. Create the tracker models and the updated point decoder with `uv run export_onnx.py`.
+The v0.6.0 models predate video tracking. Create the tracker models and the updated decoders and memory encoder with `uv run export_onnx.py`.
 
 **Inference with onnx on GPU**
 
@@ -149,9 +153,12 @@ The check compares preprocessing, image and language features, and decoder score
 
 ```sh
 uv run test_video_parity.py
+uv run test_video_inference_parity.py
 ```
 
 The check runs point, refinement, reverse, box, mask, two-object, and removal cases on the first 60 frames of `bedroom.mp4` with the PyTorch tracker in float32, and fails if a frame's mask IoU drops below 0.99.
+
+`test_video_inference_parity.py` checks `VideoInference` the same way against `build_sam3_video_model()`. It runs text and box prompts, forward and reverse, point refinement, an added object, and removal. It fails if the object ids differ, a mask IoU drops below 0.99, or a score differs by more than 0.01.
 
 ## Pre-exported ONNX models
 
