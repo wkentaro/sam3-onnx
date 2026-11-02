@@ -111,23 +111,31 @@ def main() -> None:
     logger.debug("video: {} frames of {}x{}", len(frames), width, height)
 
     if args.text_prompt is None:
-        masks, labels = track(args, sessions, frames)
+        masks, obj_ids = track(args, sessions, frames)
     else:
-        masks, labels = detect_and_track(args, sessions, frames)
+        masks, obj_ids = detect_and_track(args, sessions, frames)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
         str(args.output), cv2.VideoWriter.fourcc(*"mp4v"), fps, (width, height)
     )
     for frame_idx, frame in enumerate(frames):
-        # A label image, so each object keeps its color as others come and go.
-        label = np.zeros((height, width), np.int32)
-        for mask, obj_label in zip(masks[frame_idx], labels[frame_idx]):
-            label[mask] = obj_label
-        viz = imgviz.label2rgb(label, image=frame, alpha=0.5)
+        viz = draw(frame, masks[frame_idx], obj_ids[frame_idx])
         writer.write(np.ascontiguousarray(viz[:, :, ::-1]))
     writer.release()
     logger.info("saved: {}", args.output)
+
+
+def draw(
+    frame: NDArray[np.uint8], masks: NDArray[np.bool_], obj_ids: list[int]
+) -> NDArray[np.uint8]:
+    """Overlay each mask in a color picked by its object id, so an object
+    keeps its color as others come and go."""
+    label = np.zeros(frame.shape[:2], np.int32)
+    for mask, obj_id in zip(masks, obj_ids):
+        # The colormap has 256 colors, and label 0 is the background.
+        label[mask] = obj_id % 255 + 1
+    return imgviz.label2rgb(label, image=frame, alpha=0.5)
 
 
 def track(
@@ -163,7 +171,7 @@ def track(
         ):
             masks[frame_idx] = video_res_masks[:, 0] > 0
             logger.debug("tracked frame {}", frame_idx)
-    return masks, {frame_idx: [1] for frame_idx in masks}
+    return masks, {frame_idx: [0] for frame_idx in masks}
 
 
 def detect_and_track(
@@ -190,9 +198,8 @@ def detect_and_track(
             outputs[frame_idx] = out
             logger.debug("frame {}: objects {}", frame_idx, out["out_obj_ids"].tolist())
     masks = {i: out["out_binary_masks"] for i, out in outputs.items()}
-    # imgviz colors label 0 as the background, and object ids start at 0.
-    labels = {i: (out["out_obj_ids"] + 1).tolist() for i, out in outputs.items()}
-    return masks, labels
+    obj_ids = {i: out["out_obj_ids"].tolist() for i, out in outputs.items()}
+    return masks, obj_ids
 
 
 if __name__ == "__main__":

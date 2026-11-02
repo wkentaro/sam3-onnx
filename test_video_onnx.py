@@ -1,5 +1,6 @@
 import numpy as np
 
+from infer_video_onnx import draw
 from track_onnx import _resize
 from video_onnx import VideoInference
 from video_onnx import _mask_iou
@@ -55,8 +56,19 @@ def test_propagation_history() -> None:
     assert video._parse_action_history_for_propagation()[0] == "propagation_fetch"
 
 
+def test_draw() -> None:
+    frame = np.zeros((4, 4, 3), np.uint8)
+    masks = np.zeros((2, 4, 4), np.bool_)
+    masks[0, 0], masks[1, 1] = True, True
+    both = draw(frame, masks, [0, 300])
+    alone = draw(frame, masks[1:], [300])
+    # Object 300 keeps its color once object 0 is gone.
+    assert (both[1] == alone[1]).all() and both[1].any()
+
+
 if __name__ == "__main__":
     test_empty_masks()
     test_nms_masks()
     test_propagation_history()
+    test_draw()
     print("ok")
