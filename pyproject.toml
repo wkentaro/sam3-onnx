@@ -64,4 +64,4 @@ dev = [
 
 [tool.uv.sources]
 sam3 = { workspace = true, editable = true }
-osam = { git = "https://github.com/wkentaro/osam", rev = "c45c9968d86532b1d722cd6fbf6d6d9d2f934972" }
+osam = { git = "https://github.com/wkentaro/osam", rev = "748ac296612b2a1f86cd56a107ece705547d7d9c" }
