@@ -12,6 +12,8 @@ from loguru import logger
 from numpy.typing import NDArray
 
 import video_onnx
+from infer_onnx import DEVICE_HELP
+from infer_onnx import DEVICES
 from infer_onnx import create_sessions
 from track_onnx import MODEL_NAMES
 from track_onnx import Tracker
@@ -50,10 +52,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        choices=["cpu", "cuda", "coreml"],
+        choices=DEVICES,
         default="cpu",
-        help="Device to run the models on. cuda needs the gpu dependency group, "
-        "and coreml needs macOS.",
+        help=DEVICE_HELP,
     )
     args = parser.parse_args()
     logger.debug("input: {}", args.__dict__)

@@ -16,6 +16,7 @@ from numpy.typing import NDArray
 from onnx import numpy_helper
 from osam._models.yoloworld.clip import tokenize
 from osam.types._model import _setup_cuda
+from osam.types._model import _webgpu_device
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,10 +64,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        choices=["cpu", "cuda", "coreml"],
+        choices=DEVICES,
         default="cpu",
-        help="Device to run the models on. cuda needs the gpu dependency group, "
-        "and coreml needs macOS.",
+        help=DEVICE_HELP,
     )
     args = parser.parse_args()
     logger.debug("input: {}", args.__dict__)
@@ -263,6 +263,13 @@ def load_for_coreml(onnx_file: str) -> bytes:
     return model.SerializeToString()
 
 
+DEVICES = ["cpu", "cuda", "coreml", "webgpu"]
+DEVICE_HELP = (
+    "Device to run the models on. cuda needs the gpu dependency group, coreml "
+    "needs macOS, and webgpu needs the webgpu dependency group."
+)
+
+
 def create_sessions(
     device: str, names: list[str]
 ) -> list[onnxruntime.InferenceSession]:
@@ -297,6 +304,23 @@ def create_sessions(
         # ponytail: no ModelCacheDirectory, which saves 3 s of the compile but
         # stores another 3.5 GB keyed by model path; add it for long sessions.
         coreml_options = {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU"}
+    elif device == "webgpu":
+        # osam's onnxruntime-ep-webgpu plugin, on the adapter osam picks.
+        try:
+            webgpu_device = _webgpu_device()
+        except RuntimeError:  # the plugin is not installed
+            logger.error(
+                "WebGPU is unavailable, run with: "
+                "uv run --no-dev --group webgpu infer_onnx.py ..."
+            )
+            sys.exit(1)
+        if webgpu_device is None:
+            logger.error("WebGPU found no GPU adapter")
+            sys.exit(1)
+        # Unlike CoreML, it takes inputs whose shapes change, as the memory of
+        # the tracker does, so every model runs on the GPU.
+        sess_options.add_provider_for_devices([webgpu_device], {})
+        providers.insert(0, "WebGpuExecutionProvider")
     sessions: list[onnxruntime.InferenceSession] = []
     for name in names:
         # Only the image encoder: the decoders take longer to compile for CoreML
@@ -308,7 +332,10 @@ def create_sessions(
             # ponytail: rewritten on every run (~2 s); cache it if that matters.
             model = load_for_coreml(model)
         session = onnxruntime.InferenceSession(
-            model, sess_options, providers=session_providers
+            model,
+            sess_options,
+            # A plugin provider comes from sess_options, by device.
+            providers=None if device == "webgpu" else session_providers,
         )
         # onnxruntime silently falls back to CPU for a provider it can't use.
         (provider, *_) = session_providers
