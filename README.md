@@ -137,7 +137,15 @@ The `gpu` group installs `onnxruntime-gpu` with its CUDA and cuDNN libraries, so
 uv run --no-dev infer_onnx.py --image images/bus.jpg --text-prompt person --device coreml
 ```
 
-The image encoder runs on the GPU through CoreML, about 5x faster than on CPU (3 s against 15 s on an M5). The other models stay on CPU, where they take under 2 s.
+The image encoder runs on the GPU through CoreML, over twice as fast as on CPU (2.5 s against 6 s on an M5). The other models stay on CPU, where they take under 2 s.
+
+**Inference with onnx on WebGPU (macOS, Linux, Windows)**
+
+```sh
+uv run --no-dev --group webgpu infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --text-prompt person --device webgpu --output /tmp/bedroom.mp4
+```
+
+The `webgpu` group installs osam's WebGPU plugin, `onnxruntime-ep-webgpu`, which runs every model on the GPU through Vulkan, Direct3D 12, or Metal. For video, use it over CoreML: CoreML can't compile the tracker's memory attention, whose input grows as frames fill the memory, so a frame takes 5.8 s against 6.7 s on an M5.
 
 **Check text-prompt scores against PyTorch on CPU**
 
