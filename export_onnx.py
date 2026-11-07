@@ -425,39 +425,56 @@ def _export_point_decoder(
     model: Sam3Image, sam2_features: list[NDArray]
 ) -> onnxruntime.InferenceSession:
     onnx_file: pathlib.Path = pathlib.Path("models/sam3_point_decoder.onnx")
-    # Earlier decoders lack the outputs for tracking.
-    if onnx_file.exists() and "single_obj_ptr" in [
-        o.name for o in onnx.load(onnx_file, load_external_data=False).graph.output
-    ]:
+    graph = (
+        onnx.load(onnx_file, load_external_data=False).graph
+        if onnx_file.exists()
+        else None
+    )
+    # Earlier decoders lack the outputs for tracking, or take one object.
+    if (
+        graph is not None
+        and "single_obj_ptr" in [o.name for o in graph.output]
+        and not [
+            i.type.tensor_type.shape.dim[0].dim_value
+            for i in graph.input
+            if i.name == "image_embeddings"
+        ][0]
+    ):
         logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
     else:
+        # Two objects, which the tracker batches on one frame: their own
+        # image embeddings with memory, and that frame's high-res features.
         inputs: dict[str, NDArray] = {
-            "image_embeddings": sam2_features[0],
+            "image_embeddings": np.repeat(sam2_features[0], 2, axis=0),
             "high_res_features1": sam2_features[1],
             "high_res_features2": sam2_features[2],
-            "point_coords": np.full((1, 1, 2), 504, dtype=np.float32),
-            "point_labels": np.ones((1, 1), dtype=np.float32),
-            "mask_input": np.zeros((1, 1, 288, 288), dtype=np.float32),
+            "point_coords": np.full((2, 1, 2), 504, dtype=np.float32),
+            "point_labels": np.ones((2, 1), dtype=np.float32),
+            "mask_input": np.zeros((2, 1, 288, 288), dtype=np.float32),
             "has_mask_input": np.array([0], dtype=np.float32),
         }
+        output_names: list[str] = [
+            "iou_predictions",
+            "low_res_masks",
+            "single_iou_predictions",
+            "single_low_res_masks",
+            "object_score_logits",
+            "obj_ptrs",
+            "single_obj_ptr",
+        ]
         logger.debug("exporting onnx model: {!r}", str(onnx_file))
         torch.onnx.export(
             _PointDecoder(model=model),
             args=tuple(torch.tensor(v) for v in inputs.values()),
             f=onnx_file,
             input_names=list(inputs),
-            output_names=[
-                "iou_predictions",
-                "low_res_masks",
-                "single_iou_predictions",
-                "single_low_res_masks",
-                "object_score_logits",
-                "obj_ptrs",
-                "single_obj_ptr",
-            ],
+            output_names=output_names,
             dynamic_axes={
-                "point_coords": {1: "num_points"},
-                "point_labels": {1: "num_points"},
+                "image_embeddings": {0: "num_objects"},
+                "point_coords": {0: "num_objects", 1: "num_points"},
+                "point_labels": {0: "num_objects", 1: "num_points"},
+                "mask_input": {0: "num_objects"},
+                **{name: {0: "num_objects"} for name in output_names},
             },
             opset_version=21,
             dynamo=False,
