@@ -2,9 +2,9 @@
 
 It ports sam3/model/sam3_tracking_predictor.py and the tracking parts of
 sam3/model/sam3_tracker_base.py for the configuration that build_sam3_video_model
-uses, keeping their names so the two read side by side. The point decoder and
-memory attention run one object at a time; the per-frame state holds every
-object along the first axis.
+uses, keeping their names so the two read side by side. Memory attention
+runs one object at a time. The point decoder and the per-frame state hold
+every object along the first axis.
 """
 
 import collections
@@ -139,11 +139,16 @@ class Tracker:
         missing = set(MODEL_NAMES) - set(sessions)
         if missing:
             raise ValueError(f"missing sessions: {sorted(missing)}")
-        if "single_obj_ptr" not in [
-            o.name for o in sessions["point_decoder"].get_outputs()
-        ]:
+        point_decoder = sessions["point_decoder"]
+        if "single_obj_ptr" not in [o.name for o in point_decoder.get_outputs()]:
             raise ValueError(
                 "the point decoder predates video tracking, "
+                "re-export it with: uv run export_onnx.py"
+            )
+        # An integer is a fixed axis, and the tracker batches its objects.
+        if isinstance(point_decoder.get_inputs()[0].shape[0], int):
+            raise ValueError(
+                "the point decoder takes one object at a time, "
                 "re-export it with: uv run export_onnx.py"
             )
         self._sessions = sessions
@@ -188,11 +193,13 @@ class Tracker:
         mask_inputs: NDArray | None,
         multimask_output: bool,
     ) -> dict[str, NDArray]:
-        """Sam3TrackerBase._forward_sam_heads for one object."""
+        """Sam3TrackerBase._forward_sam_heads for a batch of objects, whose
+        backbone_features stack along the first axis."""
         _, high_res_features1, high_res_features2 = self._features(frame_idx)
+        batch_size = len(backbone_features)
         if point_inputs is None:
-            point_coords = np.zeros((1, 1, 2), dtype=np.float32)
-            point_labels = -np.ones((1, 1), dtype=np.float32)
+            point_coords = np.zeros((batch_size, 1, 2), dtype=np.float32)
+            point_labels = -np.ones((batch_size, 1), dtype=np.float32)
         else:
             point_coords = point_inputs["point_coords"]
             point_labels = point_inputs["point_labels"].astype(np.float32)
@@ -204,7 +211,9 @@ class Tracker:
             point_coords=point_coords,
             point_labels=point_labels,
             mask_input=(
-                np.zeros((1, 1, LOW_RES_MASK_SIZE, LOW_RES_MASK_SIZE), np.float32)
+                np.zeros(
+                    (batch_size, 1, LOW_RES_MASK_SIZE, LOW_RES_MASK_SIZE), np.float32
+                )
                 if mask_inputs is None
                 else mask_inputs
             ),
@@ -213,15 +222,19 @@ class Tracker:
         object_score_logits = out["object_score_logits"]
         if multimask_output:
             ious = out["iou_predictions"]
-            best = int(ious[0].argmax())
-            low_res_masks = out["low_res_masks"][:, best : best + 1]
-            obj_ptr = out["obj_ptrs"][:, best]
+            best = ious.argmax(axis=1)
+            objs = np.arange(batch_size)
+            low_res_masks = out["low_res_masks"][objs, best][:, None]
+            obj_ptr = out["obj_ptrs"][objs, best]
         else:
             ious = out["single_iou_predictions"]
             low_res_masks = out["single_low_res_masks"]
             obj_ptr = out["single_obj_ptr"]
-        if not object_score_logits[0, 0] > 0:
-            low_res_masks = np.full_like(low_res_masks, NO_OBJ_SCORE)
+        low_res_masks = np.where(
+            object_score_logits[:, :, None, None] > 0,
+            low_res_masks,
+            np.float32(NO_OBJ_SCORE),
+        )
         return {
             "ious": ious,
             "low_res_masks": low_res_masks,
@@ -324,13 +337,13 @@ class Tracker:
         track_in_reverse: bool,
         use_prev_mem_frame: bool,
         batch_size: int,
-    ) -> list[NDArray]:
+    ) -> NDArray:
         """Sam3TrackerBase._prepare_memory_conditioned_features with
-        use_memory_selection, returning each object's features."""
+        use_memory_selection, returning the features of every object."""
         image_embeddings = self._features(frame_idx)[0]
         if is_init_cond_frame or not use_prev_mem_frame:
             # The image encoder adds no_mem_embed already.
-            return [image_embeddings] * batch_size
+            return np.repeat(image_embeddings, batch_size, axis=0)
 
         tpos_sign_mul = -1 if track_in_reverse else 1
         selected_cond_outputs, unselected_cond_outputs = _select_closest_cond_frames(
@@ -386,17 +399,21 @@ class Tracker:
         obj_ptr_tpos = np.array(
             [pos for pos, _ in pos_and_ptrs], dtype=np.float32
         ) / np.float32(max_obj_ptrs_in_encoder - 1)
-        return [
-            self._run(
-                "memory_attention",
-                image_embeddings=image_embeddings,
-                memory=memory[i],
-                memory_tpos=np.array(memory_tpos, dtype=np.int64),
-                obj_ptrs=obj_ptrs[i],
-                obj_ptr_tpos=obj_ptr_tpos,
-            )["pix_feat_with_mem"]
-            for i in range(batch_size)
-        ]
+        # One object per call: a batch of objects runs out of memory on
+        # WebGPU and is no faster on CUDA.
+        return np.concatenate(
+            [
+                self._run(
+                    "memory_attention",
+                    image_embeddings=image_embeddings,
+                    memory=memory[i],
+                    memory_tpos=np.array(memory_tpos, dtype=np.int64),
+                    obj_ptrs=obj_ptrs[i],
+                    obj_ptr_tpos=obj_ptr_tpos,
+                )["pix_feat_with_mem"]
+                for i in range(batch_size)
+            ]
+        )
 
     def _track_step(
         self,
@@ -414,9 +431,9 @@ class Tracker:
         """Sam3TrackerBase.track_step, as _run_single_frame_inference keeps it."""
         if mask_inputs is not None:
             assert batch_size == 1
-            sam_outputs = [self._use_mask_as_output(frame_idx, mask_inputs)]
+            sam_outputs = self._use_mask_as_output(frame_idx, mask_inputs)
         else:
-            pix_feats_with_mem = self._prepare_memory_conditioned_features(
+            pix_feat_with_mem = self._prepare_memory_conditioned_features(
                 frame_idx=frame_idx,
                 is_init_cond_frame=is_init_cond_frame,
                 output_dict=output_dict,
@@ -429,26 +446,19 @@ class Tracker:
                 0 if point_inputs is None else point_inputs["point_labels"].shape[1]
             )
             multimask_output = 0 <= num_pts <= 1
-            sam_outputs = [
-                self._forward_sam_heads(
-                    frame_idx,
-                    backbone_features=pix_feat_with_mem,
-                    point_inputs=point_inputs,
-                    mask_inputs=prev_sam_mask_logits,
-                    multimask_output=multimask_output,
-                )
-                for pix_feat_with_mem in pix_feats_with_mem
-            ]
-        pred_masks = np.concatenate([o["low_res_masks"] for o in sam_outputs])
-        object_score_logits = np.concatenate(
-            [o["object_score_logits"] for o in sam_outputs]
-        )
-        iou_score = np.concatenate(
-            [o["ious"].max(-1, keepdims=True) for o in sam_outputs]
-        )
+            sam_outputs = self._forward_sam_heads(
+                frame_idx,
+                backbone_features=pix_feat_with_mem,
+                point_inputs=point_inputs,
+                mask_inputs=prev_sam_mask_logits,
+                multimask_output=multimask_output,
+            )
+        pred_masks = sam_outputs["low_res_masks"]
+        object_score_logits = sam_outputs["object_score_logits"]
+        iou_score = sam_outputs["ious"].max(-1, keepdims=True)
         current_out: FrameOutput = {
             "pred_masks": pred_masks,
-            "obj_ptr": np.concatenate([o["obj_ptr"] for o in sam_outputs]),
+            "obj_ptr": sam_outputs["obj_ptr"],
             "object_score_logits": object_score_logits,
             "iou_score": iou_score,
             "eff_iou_score": self._cal_mem_score(object_score_logits, iou_score),
