@@ -132,6 +132,7 @@ def run_onnx(args: argparse.Namespace, paths: list[pathlib.Path]) -> dict:
     from infer_onnx import postprocess_decoder_output
     from infer_onnx import postprocess_point_decoder_output
     from infer_onnx import preprocess_image
+    from infer_onnx import run_on_device
     from infer_onnx import run_point_decoder
 
     names = ["image_encoder", *video_onnx.MODEL_NAMES]
@@ -143,6 +144,10 @@ def run_onnx(args: argparse.Namespace, paths: list[pathlib.Path]) -> dict:
     timings: Timings = collections.defaultdict(list)
     for name, session in sessions.items():
         session.run = _timed(timings, name, session.run, lambda: None)  # type: ignore[method-assign]
+        # run_on_device runs CUDA and WebGPU sessions with this instead.
+        session.run_with_iobinding = _timed(  # type: ignore[method-assign]
+            timings, name, session.run_with_iobinding, lambda: None
+        )
 
     def measure(make_steps: typing.Callable[[], typing.Iterable]) -> dict[str, float]:
         return _measure_warm(make_steps, timings, lambda: None)
@@ -153,8 +158,10 @@ def run_onnx(args: argparse.Namespace, paths: list[pathlib.Path]) -> dict:
     size = {"image_width": image.width, "image_height": image.height}
 
     def detect(text: str, boxes: list[list[float]]) -> None:
-        image_out = sessions["image_encoder"].run(
-            DECODER_FEATURES, {"image": preprocess_image(image)}
+        image_out = run_on_device(
+            sessions["image_encoder"],
+            DECODER_FEATURES,
+            {"image": preprocess_image(image)},
         )
         text_out = sessions["language_encoder"].run(
             None, {"tokens": tokenize(texts=[text], context_length=32)}
@@ -171,7 +178,8 @@ def run_onnx(args: argparse.Namespace, paths: list[pathlib.Path]) -> dict:
         postprocess_decoder_output(boxes=boxes_out, masks=masks, **size)
 
     def segment_point() -> None:
-        features = sessions["image_encoder"].run(
+        features = run_on_device(
+            sessions["image_encoder"],
             POINT_DECODER_FEATURES,
             {"image": preprocess_image(image)},
         )

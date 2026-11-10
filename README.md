@@ -134,6 +134,8 @@ UV_PROJECT_ENVIRONMENT=.venv-gpu uv run --no-dev --no-group cpu --group gpu infe
 
 Add `--fp16` to run the float16 models, which `uv run postprocess_onnx.py --fp16 models/*.onnx` writes. On an RTX 3080 Ti they track a video frame in 229 ms against 400 ms, with the same detections and masks within the difference that PyTorch has between bfloat16 and float32. `--fp16` works with `--device cuda`, `webgpu`, and `coreml`, and leaves the models that run on the CPU in float32.
 
+On `--device cuda` and `webgpu`, the image encoder's features stay on the GPU for the models that read them, as `infer_onnx.run_on_device` returns them. With `--fp16` on CUDA, that takes a text prompt on an image from 249 ms to 225 ms, as its 116 MB of features no longer go to the CPU and back.
+
 The `gpu` group installs `onnxruntime-gpu` with its CUDA and cuDNN libraries, so no system CUDA install is needed. Keep it in its own environment without the dev group: onnxruntime and onnxruntime-gpu overwrite each other's files, and so do the cuDNN libraries of torch and onnxruntime-gpu.
 
 **Inference with onnx on Apple GPU (macOS)**
@@ -180,7 +182,7 @@ uv run benchmark.py --runtime torch
 UV_PROJECT_ENVIRONMENT=.venv-gpu uv run --no-dev --no-group cpu --group gpu benchmark.py --device cuda
 ```
 
-`benchmark.py` runs text, box, and point prompts on `images/bus.jpg`, then point, box, and text prompts through 40 frames of `bedroom.mp4`. It prints the mean time of each model and of the whole in milliseconds, per image or per tracked frame. Each case runs once untimed first. A frame's time runs from the JPEG files of the video to the masks of its last frame, over the frame count, so it holds loading the frames in both runtimes. Compare the totals across runtimes: a model's time on the PyTorch side is that of the nearest module, which does less than the ONNX model. `--runtime torch` runs upstream as it ships, in bfloat16 on CUDA. `--device` takes the same values as `infer_onnx.py`.
+`benchmark.py` runs text, box, and point prompts on `images/bus.jpg`, then point, box, and text prompts through 40 frames of `bedroom.mp4`. It prints the mean time of each model and of the whole in milliseconds, per image or per tracked frame. Each case runs once untimed first. A frame's time runs from the JPEG files of the video to the masks of its last frame, over the frame count, so it holds loading the frames in both runtimes. Compare the totals across runtimes: a model's time on the PyTorch side is that of the nearest module, which does less than the ONNX model. `--runtime torch` runs upstream as it ships, in bfloat16 on CUDA. `--device` takes the same values as `infer_onnx.py`. On WebGPU, a run returns before the GPU finishes the features it keeps on the GPU, so their time counts toward the model that reads them first; the totals hold.
 
 ## Pre-exported ONNX models
 

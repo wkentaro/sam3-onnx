@@ -186,7 +186,7 @@ def postprocess_point_decoder_output(
 
 def run_point_decoder(
     sess_point_decode: onnxruntime.InferenceSession,
-    sam2_features: list[NDArray],
+    sam2_features: list[typing.Any],
     point_prompt: list[list[float]],
     multimask_output: bool = True,
 ) -> tuple[NDArray, NDArray]:
@@ -416,6 +416,40 @@ def create_sessions(
     return sessions
 
 
+# The device of the outputs that run_on_device keeps, by provider.
+_OUTPUT_DEVICES: dict[str, str] = {
+    "CUDAExecutionProvider": "cuda",
+    "WebGpuExecutionProvider": "webgpu",
+}
+
+
+def run_on_device(
+    session: onnxruntime.InferenceSession,
+    output_names: list[str],
+    inputs: dict[str, typing.Any],
+) -> list[typing.Any]:
+    """session.run, but on CUDA and WebGPU the outputs stay on the GPU as
+    OrtValues.
+
+    Another session on the same device takes them as inputs, as session.run
+    takes OrtValues, without the copy to the CPU and back. Elsewhere it
+    returns numpy arrays as session.run does.
+    """
+    device = _OUTPUT_DEVICES.get(session.get_providers()[0])
+    if device is None:
+        return list(session.run(output_names, inputs))
+    binding = session.io_binding()
+    for name, value in inputs.items():
+        if isinstance(value, onnxruntime.OrtValue):  # type: ignore[possibly-missing-attribute]
+            binding.bind_ortvalue_input(name, value)
+        else:
+            binding.bind_cpu_input(name, value)
+    for name in output_names:
+        binding.bind_output(name, device)
+    session.run_with_iobinding(binding)
+    return binding.get_outputs()
+
+
 def main():
     args = parse_args()
 
@@ -436,12 +470,9 @@ def main():
     output_names: list[str] = (
         POINT_DECODER_FEATURES if args.point_prompt else DECODER_FEATURES
     )
-    output = sess_image.run(
-        output_names,
-        {"image": preprocess_image(image)},
+    features = run_on_device(
+        sess_image, output_names, {"image": preprocess_image(image)}
     )
-    assert all(isinstance(o, np.ndarray) for o in output)
-    output = typing.cast(list[NDArray], output)
     logger.debug("finished running image encoder")
 
     if args.point_prompt:
@@ -456,7 +487,7 @@ def main():
         logger.debug("running point decoder...")
         iou_predictions, low_res_masks = run_point_decoder(
             sess_point_decode=sess_decoders[0],
-            sam2_features=output,
+            sam2_features=features,
             point_prompt=args.point_prompt,
             multimask_output=not args.single_mask,
         )
@@ -478,7 +509,6 @@ def main():
         return
 
     sess_language, sess_decode = sess_decoders
-    features: dict[str, NDArray] = dict(zip(DECODER_FEATURES, output))
 
     logger.debug("running language encoder...")
     text_prompt: str = args.text_prompt if args.text_prompt else "visual"
@@ -510,7 +540,7 @@ def main():
     output = sess_decode.run(
         ["boxes", "scores", "masks"],
         {
-            **features,
+            **dict(zip(DECODER_FEATURES, features)),
             "language_mask": language_mask,
             "language_features": language_features,
             **box_inputs,
