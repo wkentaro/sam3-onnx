@@ -125,6 +125,8 @@ def run_onnx(args: argparse.Namespace, paths: list[pathlib.Path]) -> dict:
 
     import track_onnx
     import video_onnx
+    from infer_onnx import DECODER_FEATURES
+    from infer_onnx import POINT_DECODER_FEATURES
     from infer_onnx import create_sessions
     from infer_onnx import make_box_inputs
     from infer_onnx import postprocess_decoder_output
@@ -152,7 +154,7 @@ def run_onnx(args: argparse.Namespace, paths: list[pathlib.Path]) -> dict:
 
     def detect(text: str, boxes: list[list[float]]) -> None:
         image_out = sessions["image_encoder"].run(
-            None, {"image": preprocess_image(image)}
+            DECODER_FEATURES, {"image": preprocess_image(image)}
         )
         text_out = sessions["language_encoder"].run(
             None, {"tokens": tokenize(texts=[text], context_length=32)}
@@ -160,10 +162,7 @@ def run_onnx(args: argparse.Namespace, paths: list[pathlib.Path]) -> dict:
         boxes_out, _, masks = sessions["decoder"].run(
             ["boxes", "scores", "masks"],
             {
-                "vision_pos_enc_2": image_out[2],
-                "backbone_fpn_0": image_out[3],
-                "backbone_fpn_1": image_out[4],
-                "backbone_fpn_2": image_out[5],
+                **dict(zip(DECODER_FEATURES, image_out)),
                 "language_mask": text_out[0],
                 "language_features": text_out[1],
                 **make_box_inputs(sessions["decoder"], boxes),
@@ -173,7 +172,7 @@ def run_onnx(args: argparse.Namespace, paths: list[pathlib.Path]) -> dict:
 
     def segment_point() -> None:
         features = sessions["image_encoder"].run(
-            ["image_embeddings", "high_res_features1", "high_res_features2"],
+            POINT_DECODER_FEATURES,
             {"image": preprocess_image(image)},
         )
         iou_predictions, low_res_masks = run_point_decoder(

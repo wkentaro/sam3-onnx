@@ -264,6 +264,21 @@ def load_for_coreml(onnx_file: str) -> bytes:
     return model.SerializeToString()
 
 
+# The image encoder outputs that each decoder reads. Fetching these alone
+# skips vision_pos_enc_0 and vision_pos_enc_1, 106 MB of constants that no
+# model reads and that would be copied from the GPU on every run.
+DECODER_FEATURES: list[str] = [
+    "vision_pos_enc_2",
+    "backbone_fpn_0",
+    "backbone_fpn_1",
+    "backbone_fpn_2",
+]
+POINT_DECODER_FEATURES: list[str] = [
+    "image_embeddings",
+    "high_res_features1",
+    "high_res_features2",
+]
+
 DEVICES = ["cpu", "cuda", "coreml", "webgpu"]
 DEVICE_HELP = (
     "Device to run the models on. cuda needs the gpu dependency group, coreml "
@@ -391,10 +406,7 @@ def main():
 
     logger.debug("running image encoder...")
     output_names: list[str] = (
-        ["image_embeddings", "high_res_features1", "high_res_features2"]
-        if args.point_prompt
-        else [f"vision_pos_enc_{i}" for i in range(3)]
-        + [f"backbone_fpn_{i}" for i in range(3)]
+        POINT_DECODER_FEATURES if args.point_prompt else DECODER_FEATURES
     )
     output = sess_image.run(
         output_names,
@@ -438,8 +450,7 @@ def main():
         return
 
     sess_language, sess_decode = sess_decoders
-    vision_pos_enc: list[NDArray] = output[:3]
-    backbone_fpn: list[NDArray] = output[3:]
+    features: dict[str, NDArray] = dict(zip(DECODER_FEATURES, output))
 
     logger.debug("running language encoder...")
     text_prompt: str = args.text_prompt if args.text_prompt else "visual"
@@ -471,10 +482,7 @@ def main():
     output = sess_decode.run(
         ["boxes", "scores", "masks"],
         {
-            "backbone_fpn_0": backbone_fpn[0],
-            "backbone_fpn_1": backbone_fpn[1],
-            "backbone_fpn_2": backbone_fpn[2],
-            "vision_pos_enc_2": vision_pos_enc[2],
+            **features,
             "language_mask": language_mask,
             "language_features": language_features,
             **box_inputs,
