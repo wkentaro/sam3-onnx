@@ -5,6 +5,7 @@ from track_onnx import FAR_OLD_FRAMES
 from track_onnx import MAX_OBJ_PTRS_IN_ENCODER
 from track_onnx import Tracker
 from track_onnx import _new_output_dict
+from track_onnx import _pad_memory_attention_inputs
 from track_onnx import _resize
 from video_onnx import VideoInference
 from video_onnx import _mask_iou
@@ -98,6 +99,7 @@ def test_trim_far_old_memory() -> None:
     cond["maskmem_features"] = np.ones((1, 1), np.float32)
     tracker.output_dict["cond_frame_outputs"][far + 2] = cond
     tracker._features = lambda frame_idx: [np.zeros((1, 1), np.float32)]
+    tracker._sessions = {}
     inputs = {}
     tracker._run = lambda name, **kwargs: (
         inputs.update(kwargs) or {"pix_feat_with_mem": kwargs["image_embeddings"]}
@@ -111,6 +113,32 @@ def test_trim_far_old_memory() -> None:
         batch_size=1,
     )
     assert len(inputs["memory"]) == 1  # the conditioning frame alone
+
+
+def test_pad_memory_attention_inputs() -> None:
+    inputs = _pad_memory_attention_inputs(
+        memory=np.ones((3, 64, 72, 72), np.float32),
+        memory_tpos=np.array([6, 5, 4]),
+        obj_ptrs=np.ones((5, 256), np.float32),
+        obj_ptr_tpos=np.arange(5, dtype=np.float32),
+    )
+    assert inputs["memory"].shape == (7, 64, 72, 72)
+    assert inputs["memory_tpos"].tolist() == [6, 5, 4, 0, 0, 0, 0]
+    assert inputs["memory_tpos"].dtype == np.int64
+    assert inputs["obj_ptrs"].shape == (16, 256)
+    assert inputs["obj_ptr_tpos"].shape == (16,)
+    # The padding is marked invalid, and holds nothing.
+    assert inputs["memory_valid"].tolist() == [1, 1, 1, 0, 0, 0, 0]
+    assert inputs["obj_ptr_valid"].tolist() == [1] * 5 + [0] * 11
+    assert not inputs["memory"][3:].any() and not inputs["obj_ptrs"][5:].any()
+    # No pointers at all, as reverse tracking from the last frame has.
+    empty = _pad_memory_attention_inputs(
+        memory=np.ones((1, 64, 72, 72), np.float32),
+        memory_tpos=np.array([6]),
+        obj_ptrs=np.zeros((0, 256), np.float32),
+        obj_ptr_tpos=np.zeros(0, np.float32),
+    )
+    assert not empty["obj_ptr_valid"].any()
 
 
 def test_draw() -> None:
@@ -128,5 +156,6 @@ if __name__ == "__main__":
     test_nms_masks()
     test_propagation_history()
     test_trim_far_old_memory()
+    test_pad_memory_attention_inputs()
     test_draw()
     print("ok")

@@ -26,6 +26,8 @@ from infer_onnx import preprocess_image
 from infer_onnx import run_point_decoder
 from infer_torch import get_replace_freqs_cis
 from postprocess_onnx import postprocess
+from track_onnx import FIXED_NUM_MEMORIES
+from track_onnx import FIXED_NUM_OBJ_PTRS
 
 MAX_BOXES: int = 16
 
@@ -628,6 +630,7 @@ class _MemoryAttention(torch.nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         num_k_rope: int | torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """RoPEAttention.forward for one head, with num_k_rope traced."""
         q = _rope(attention.q_proj(q)[:, None], self._cos, self._sin)
@@ -637,7 +640,9 @@ class _MemoryAttention(torch.nn.Module):
             dim=2,
         )
         v = attention.v_proj(v)[:, None]
-        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask
+        )
         return attention.out_proj(out[:, 0])
 
     def forward(
@@ -647,6 +652,8 @@ class _MemoryAttention(torch.nn.Module):
         memory_tpos: torch.Tensor,
         obj_ptrs: torch.Tensor,
         obj_ptr_tpos: torch.Tensor,
+        memory_valid: torch.Tensor | None = None,
+        obj_ptr_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, channels, height, width = image_embeddings.shape
         pix_feat = image_embeddings - self._no_mem_embed.view(1, -1, 1, 1)
@@ -669,6 +676,17 @@ class _MemoryAttention(torch.nn.Module):
         prompt = torch.cat([prompt_memory, prompt_ptrs], dim=1)
         prompt_pos = torch.cat([prompt_memory_pos, prompt_ptrs_pos], dim=1)
 
+        # The fixed-shape model takes padded memories and pointers, and gives
+        # the padding no weight.
+        attn_mask: torch.Tensor | None = None
+        if memory_valid is not None and obj_ptr_valid is not None:
+            attn_mask = torch.cat(
+                [
+                    ((memory_valid - 1) * 1e4).repeat_interleave(height * width),
+                    ((obj_ptr_valid - 1) * 1e4).repeat_interleave(split),
+                ]
+            ).view(1, 1, 1, -1)
+
         # TransformerEncoderCrossAttention.forward with TransformerDecoderLayerv2
         # in pre-norm, self-attention first.
         output = src + 0.1 * self._src_pos
@@ -684,6 +702,7 @@ class _MemoryAttention(torch.nn.Module):
                 prompt + prompt_pos,
                 prompt,
                 num_k_rope=num_k_rope,
+                attn_mask=attn_mask,
             )
             tgt = layer.norm3(output)
             output = output + layer.linear2(layer.activation(layer.linear1(tgt)))
@@ -764,6 +783,24 @@ def _export_tracker_models(
             "obj_ptrs": {0: "num_ptrs"},
             "obj_ptr_tpos": {0: "num_ptrs"},
         },
+    )
+    # CoreML can't compile an input whose shape changes, so it takes this copy,
+    # padded to the memories and pointers of one conditioning frame. Other
+    # providers run the model above, which is faster for them.
+    num_memories, num_ptrs = FIXED_NUM_MEMORIES, FIXED_NUM_OBJ_PTRS
+    export(
+        "memory_attention_fixed",
+        lambda: _MemoryAttention(model=model, vision_pos_enc=vision_pos_enc),
+        inputs={
+            "image_embeddings": image_embeddings,
+            "memory": rng.normal(size=(num_memories, 64, 72, 72)).astype(np.float32),
+            "memory_tpos": np.arange(num_memories)[::-1].copy(),
+            "obj_ptrs": rng.normal(size=(num_ptrs, 256)).astype(np.float32),
+            "obj_ptr_tpos": (np.arange(num_ptrs) / 15).astype(np.float32),
+            "memory_valid": np.ones(num_memories, dtype=np.float32),
+            "obj_ptr_valid": np.ones(num_ptrs, dtype=np.float32),
+        },
+        output_names=["pix_feat_with_mem"],
     )
     export(
         "mask_downsampler",

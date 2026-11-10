@@ -31,6 +31,11 @@ MAX_POINT_NUM_IN_PROMPT_ENC: int = 16
 # far_old_frame_idx of track_step, in multiples of MAX_OBJ_PTRS_IN_ENCODER
 FAR_OLD_FRAMES: int = 20
 
+# The memories and object pointers that sam3_memory_attention_fixed.onnx takes:
+# those of one conditioning frame. More conditioning frames give up to 10 and 19.
+FIXED_NUM_MEMORIES: int = NUM_MASKMEM
+FIXED_NUM_OBJ_PTRS: int = MAX_OBJ_PTRS_IN_ENCODER
+
 # The sessions Tracker runs, as models/sam3_{name}.onnx.
 MODEL_NAMES: tuple[str, ...] = (
     "point_decoder",
@@ -82,6 +87,33 @@ def _resize_antialias(
     )
 
 
+def _pad_memory_attention_inputs(
+    memory: NDArray,
+    memory_tpos: NDArray,
+    obj_ptrs: NDArray,
+    obj_ptr_tpos: NDArray,
+) -> dict[str, NDArray]:
+    """The inputs of sam3_memory_attention_fixed.onnx for one object: n
+    memories and p object pointers padded to its fixed counts, with the
+    padding marked invalid so it gets no attention."""
+
+    def pad(x: NDArray, size: int) -> NDArray:
+        padding = np.zeros((size - len(x), *x.shape[1:]), x.dtype)
+        return np.concatenate([x, padding])
+
+    def valid(x: NDArray, size: int) -> NDArray:
+        return (np.arange(size) < len(x)).astype(np.float32)
+
+    return {
+        "memory": pad(memory, FIXED_NUM_MEMORIES),
+        "memory_tpos": pad(memory_tpos, FIXED_NUM_MEMORIES),
+        "obj_ptrs": pad(obj_ptrs, FIXED_NUM_OBJ_PTRS),
+        "obj_ptr_tpos": pad(obj_ptr_tpos, FIXED_NUM_OBJ_PTRS),
+        "memory_valid": valid(memory, FIXED_NUM_MEMORIES),
+        "obj_ptr_valid": valid(obj_ptrs, FIXED_NUM_OBJ_PTRS),
+    }
+
+
 def encode_frame(
     session: onnxruntime.InferenceSession, frame: NDArray[np.uint8]
 ) -> list[NDArray]:
@@ -123,6 +155,8 @@ class Tracker:
 
     get_features(frame_idx) returns the image encoder's image_embeddings,
     high_res_features1, and high_res_features2 for that frame.
+
+    sessions can also hold "memory_attention_fixed", which CoreML can run.
     """
 
     def __init__(
@@ -400,19 +434,30 @@ class Tracker:
         ) / np.float32(max_obj_ptrs_in_encoder - 1)
         # One object per call: a batch of objects runs out of memory on
         # WebGPU and is no faster on CUDA.
-        return np.concatenate(
-            [
-                self._run(
-                    "memory_attention",
-                    image_embeddings=image_embeddings,
-                    memory=memory[i],
-                    memory_tpos=np.array(memory_tpos, dtype=np.int64),
-                    obj_ptrs=obj_ptrs[i],
-                    obj_ptr_tpos=obj_ptr_tpos,
-                )["pix_feat_with_mem"]
-                for i in range(batch_size)
-            ]
-        )
+        outputs: list[NDArray] = []
+        for i in range(batch_size):
+            inputs: dict[str, NDArray] = {
+                "memory": memory[i],
+                "memory_tpos": np.array(memory_tpos, dtype=np.int64),
+                "obj_ptrs": obj_ptrs[i],
+                "obj_ptr_tpos": obj_ptr_tpos,
+            }
+            name = "memory_attention"
+            # The fixed-shape copy gives the same output, on CoreML. Prompts
+            # on several frames can pass its counts, which the other takes.
+            if (
+                "memory_attention_fixed" in self._sessions
+                and len(memory_tpos) <= FIXED_NUM_MEMORIES
+                and obj_ptrs.shape[1] <= FIXED_NUM_OBJ_PTRS
+            ):
+                name = "memory_attention_fixed"
+                inputs = _pad_memory_attention_inputs(**inputs)
+            outputs.append(
+                self._run(name, image_embeddings=image_embeddings, **inputs)[
+                    "pix_feat_with_mem"
+                ]
+            )
+        return np.concatenate(outputs)
 
     def _track_step(
         self,
