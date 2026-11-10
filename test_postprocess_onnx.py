@@ -299,7 +299,11 @@ def test_convert_int8() -> None:
             ],
             "test",
             [helper.make_tensor_value_info("x", TensorProto.FLOAT, [8, 64])],
-            [helper.make_tensor_value_info("y", TensorProto.FLOAT, [8, 8])],
+            # An initializer can be an output too.
+            [
+                helper.make_tensor_value_info("y", TensorProto.FLOAT, [8, 8]),
+                helper.make_tensor_value_info("w", TensorProto.FLOAT, [32, 64]),
+            ],
             [
                 numpy_helper.from_array(
                     rng.standard_normal((32, 64), dtype=np.float32), "w"
@@ -314,11 +318,11 @@ def test_convert_int8() -> None:
         int8_file = tmp_path / "model_int8.onnx"
         onnx.save(model, onnx_file)
         feeds = {"x": rng.standard_normal((8, 64), dtype=np.float32)}
-        (expected,) = onnxruntime.InferenceSession(onnx_file).run(None, feeds)
+        (expected, _) = onnxruntime.InferenceSession(onnx_file).run(None, feeds)
 
         convert_int8(onnx_file, int8_file)
 
-        (y,) = onnxruntime.InferenceSession(int8_file).run(None, feeds)
+        (y, _) = onnxruntime.InferenceSession(int8_file).run(None, feeds)
         y = np.asarray(y)
         assert y.dtype == np.float32
         expected = np.asarray(expected)

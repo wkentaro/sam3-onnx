@@ -381,6 +381,7 @@ def convert_int8(onnx_file: pathlib.Path, output_file: pathlib.Path) -> None:
     graph.node.extend(nodes)
     # Drop the {N, K} weights that only the Gemms read.
     used: set[str] = {name for n in _all_nodes(graph) for name in n.input}
+    used.update(o.name for o in graph.output)
     for index in reversed(range(len(graph.initializer))):
         if graph.initializer[index].name not in used:
             del graph.initializer[index]
