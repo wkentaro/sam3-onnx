@@ -28,6 +28,8 @@ MAX_OBJ_PTRS_IN_ENCODER: int = 16
 MF_THRESHOLD: float = 0.01
 NO_OBJ_SCORE: float = -1024.0
 MAX_POINT_NUM_IN_PROMPT_ENC: int = 16
+# far_old_frame_idx of track_step, in multiples of MAX_OBJ_PTRS_IN_ENCODER
+FAR_OLD_FRAMES: int = 20
 
 # The sessions Tracker runs, as models/sam3_{name}.onnx.
 MODEL_NAMES: tuple[str, ...] = (
@@ -43,11 +45,6 @@ OutputDict = dict[str, dict[int, FrameOutput]]
 
 def _new_output_dict() -> OutputDict:
     return {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
-
-
-def _to_bfloat16(x: NDArray[np.float32]) -> NDArray[np.float32]:
-    """Round to bfloat16 and back, as the tracker stores its memories."""
-    return x.astype(ml_dtypes.bfloat16).astype(np.float32)
 
 
 def _resize(x: NDArray[np.float32], height: int, width: int) -> NDArray[np.float32]:
@@ -282,7 +279,7 @@ class Tracker:
         non_overlapping: bool = False,
     ) -> NDArray:
         """Sam3TrackerBase._encode_new_memory, stored in bfloat16 as
-        Sam3TrackerPredictor does."""
+        Sam3TrackerPredictor does, which halves the memory it holds."""
         maskmem_features = self._run(
             "memory_encoder",
             image_embeddings=self._features(frame_idx)[0],
@@ -291,7 +288,7 @@ class Tracker:
             object_score_logits=object_score_logits,
             non_overlapping=np.array([non_overlapping], dtype=np.float32),
         )["maskmem_features"]
-        return _to_bfloat16(maskmem_features)
+        return maskmem_features.astype(ml_dtypes.bfloat16)
 
     # }}
 
@@ -367,7 +364,8 @@ class Tracker:
         memories: list[NDArray] = []
         memory_tpos: list[int] = []
         for t_pos, prev, is_selected_cond_frame in t_pos_and_prevs:
-            if prev is None:
+            # _frame_filter keeps the adjacent frame even when trimmed.
+            if prev is None or prev["maskmem_features"] is None:
                 continue
             memories.append(prev["maskmem_features"])
             t = t_pos if not is_selected_cond_frame else 0
@@ -389,7 +387,8 @@ class Tracker:
             if out is not None:
                 pos_and_ptrs.append((t_diff, out["obj_ptr"]))
 
-        memory = np.stack(memories, axis=1)  # (batch_size, n, 64, 72, 72)
+        # (batch_size, n, 64, 72, 72)
+        memory = np.stack(memories, axis=1).astype(np.float32)
         # Reverse tracking from the last frame can have no pointers at all.
         obj_ptrs = (
             np.stack([ptr for _, ptr in pos_and_ptrs], axis=1)
@@ -841,9 +840,26 @@ class Tracker:
                 batch_size=self._get_obj_num(),
             )
             output_dict[storage_key][frame_idx] = current_out
+            self._trim_far_old_memory(frame_idx, reverse)
         self._add_output_per_object(frame_idx, current_out, storage_key)
         self.frames_already_tracked[frame_idx] = {"reverse": reverse}
         return current_out
+
+    def _trim_far_old_memory(self, frame_idx: int, reverse: bool) -> None:
+        """Sam3TrackerBase.track_step's trim of too old frames for memory
+        selection, behind the frame in either direction, so the memory the
+        tracker holds stays bounded on long videos. The frame keeps its mask,
+        pointer, and score. Without eff_iou_score, _frame_filter skips it."""
+        far_old_frame_idx = frame_idx + (1 if reverse else -1) * (
+            FAR_OLD_FRAMES * MAX_OBJ_PTRS_IN_ENCODER
+        )
+        non_cond_frame_outputs = self.output_dict["non_cond_frame_outputs"]
+        out = non_cond_frame_outputs.get(far_old_frame_idx)
+        if out is None or out["maskmem_features"] is None:
+            return
+        out["maskmem_features"] = None
+        out.pop("eff_iou_score", None)
+        self._add_output_per_object(far_old_frame_idx, out, "non_cond_frame_outputs")
 
     def update_memories(
         self, frame_idx: int, high_res_masks: NDArray, object_score_logits: NDArray
@@ -981,10 +997,13 @@ class Tracker:
                     "object_score_logits",
                     "iou_score",
                 ]:
-                    out[key] = out[key][remain_old_obj_inds]
-                out["eff_iou_score"] = self._cal_mem_score(
-                    out["object_score_logits"], out["iou_score"]
-                )
+                    if out[key] is not None:
+                        out[key] = out[key][remain_old_obj_inds]
+                # A trimmed frame stays out of the memory selection.
+                if "eff_iou_score" in out:
+                    out["eff_iou_score"] = self._cal_mem_score(
+                        out["object_score_logits"], out["iou_score"]
+                    )
                 self._add_output_per_object(frame_idx, out, storage_key)
         return self.obj_ids
 

@@ -1,6 +1,10 @@
 import numpy as np
 
 from infer_video_onnx import draw
+from track_onnx import FAR_OLD_FRAMES
+from track_onnx import MAX_OBJ_PTRS_IN_ENCODER
+from track_onnx import Tracker
+from track_onnx import _new_output_dict
 from track_onnx import _resize
 from video_onnx import VideoInference
 from video_onnx import _mask_iou
@@ -56,6 +60,59 @@ def test_propagation_history() -> None:
     assert video._parse_action_history_for_propagation()[0] == "propagation_fetch"
 
 
+def test_trim_far_old_memory() -> None:
+    far = FAR_OLD_FRAMES * MAX_OBJ_PTRS_IN_ENCODER
+    tracker = object.__new__(Tracker)
+    tracker.num_frames = far + 3
+    tracker.output_dict = _new_output_dict()
+    tracker.output_dict_per_obj = {0: _new_output_dict()}
+    for frame_idx in [1, far + 2]:
+        out = {
+            "maskmem_features": np.ones((1, 1), np.float32),
+            "pred_masks": np.ones((1, 1, 2, 2), np.float32),
+            "obj_ptr": np.ones((1, 2), np.float32),
+            "object_score_logits": np.ones((1, 1), np.float32),
+            "iou_score": np.ones((1, 1), np.float32),
+            "eff_iou_score": 1.0,
+        }
+        tracker.output_dict["non_cond_frame_outputs"][frame_idx] = out
+        tracker._add_output_per_object(frame_idx, out, "non_cond_frame_outputs")
+
+    def trimmed() -> list[list[bool]]:
+        return [
+            [out["maskmem_features"] is None for out in outputs.values()]
+            for output_dict in [tracker.output_dict, tracker.output_dict_per_obj[0]]
+            for outputs in [output_dict["non_cond_frame_outputs"]]
+        ]
+
+    tracker._trim_far_old_memory(far + 1, reverse=False)
+    assert trimmed() == [[True, False]] * 2
+    # The trimmed frame keeps its mask but is out of the memory selection.
+    assert tracker.output_dict["non_cond_frame_outputs"][1]["pred_masks"] is not None
+    assert 1 not in tracker._frame_filter(tracker.output_dict, False, far + 2)
+    tracker._trim_far_old_memory(2, reverse=True)
+    assert trimmed() == [[True, True]] * 2
+
+    # Tracking next to a trimmed frame leaves its memory out.
+    cond = {**tracker.output_dict["non_cond_frame_outputs"][far + 2]}
+    cond["maskmem_features"] = np.ones((1, 1), np.float32)
+    tracker.output_dict["cond_frame_outputs"][far + 2] = cond
+    tracker._features = lambda frame_idx: [np.zeros((1, 1), np.float32)]
+    inputs = {}
+    tracker._run = lambda name, **kwargs: (
+        inputs.update(kwargs) or {"pix_feat_with_mem": kwargs["image_embeddings"]}
+    )
+    tracker._prepare_memory_conditioned_features(
+        frame_idx=0,
+        is_init_cond_frame=False,
+        output_dict=tracker.output_dict,
+        track_in_reverse=True,
+        use_prev_mem_frame=True,
+        batch_size=1,
+    )
+    assert len(inputs["memory"]) == 1  # the conditioning frame alone
+
+
 def test_draw() -> None:
     frame = np.zeros((4, 4, 3), np.uint8)
     masks = np.zeros((2, 4, 4), np.bool_)
@@ -70,5 +127,6 @@ if __name__ == "__main__":
     test_empty_masks()
     test_nms_masks()
     test_propagation_history()
+    test_trim_far_old_memory()
     test_draw()
     print("ok")
