@@ -53,6 +53,9 @@ uv run export_onnx.py
 # or convert models from an older export in place, as export_onnx.py does
 uv run postprocess_onnx.py models/*.onnx && rm models/*.onnx.data
 
+# write float16 copies for GPUs, as models/*_fp16.onnx
+uv run postprocess_onnx.py --fp16 models/*.onnx
+
 # upload to Hugging Face Hub
 # uvx hf upload wkentaro/sam3-onnx-models-v0.6.0 models/ --include '*.onnx'
 ```
