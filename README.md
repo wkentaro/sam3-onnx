@@ -107,6 +107,22 @@ uv run infer_onnx.py --image images/bus.jpg --point-prompt 0.18,0.55
 uv run infer_onnx.py --image images/bus.jpg --point-prompt 0.18,0.55 --point-prompt 0.2,0.7 --single-mask  # one mask, for several points
 ```
 
+**Video tracking with onnx**
+
+```sh
+# find and track every person from --frame-idx through the video, both ways
+uv run infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --text-prompt person --output /tmp/bedroom.mp4
+# track the object at a point or box on --frame-idx through the video, both ways
+uv run infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --point-prompt 0.22,0.65 --output /tmp/bedroom.mp4
+uv run infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --box-prompt 0.417,0.37,0.208,0.741 --output /tmp/bedroom.mp4
+```
+
+`video_onnx.VideoInference` ports SAM3's video predictor (`Sam3VideoInferenceWithInstanceInteractivity`). A text prompt finds the objects on every frame with `sam3_decoder.onnx`, and a `Tracker` tracks each one. Points then refine an object or add one, and `remove_object` drops one.
+
+`track_onnx.Tracker` ports SAM3's video tracker (`Sam3TrackerPredictor`) to numpy on top of four models: `sam3_point_decoder.onnx`, `sam3_memory_encoder.onnx`, `sam3_memory_attention.onnx`, and `sam3_mask_downsampler.onnx`. It takes point, box, and mask prompts for several objects, refinement clicks on any frame, forward and reverse propagation, and object removal, with the same method names as the PyTorch predictor.
+
+The v0.6.0 models predate video tracking. Create the tracker models and the updated decoders and memory encoder with `uv run export_onnx.py`.
+
 **Inference with onnx on GPU**
 
 ```sh
@@ -121,7 +137,15 @@ The `gpu` group installs `onnxruntime-gpu` with its CUDA and cuDNN libraries, so
 uv run --no-dev infer_onnx.py --image images/bus.jpg --text-prompt person --device coreml
 ```
 
-The image encoder runs on the GPU through CoreML, about 5x faster than on CPU (3 s against 15 s on an M5). The other models stay on CPU, where they take under 2 s.
+The image encoder runs on the GPU through CoreML, over twice as fast as on CPU (2.5 s against 6 s on an M5). The other models stay on CPU, where they take under 2 s.
+
+**Inference with onnx on WebGPU (macOS, Linux, Windows)**
+
+```sh
+uv run --no-dev --group webgpu infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --text-prompt person --device webgpu --output /tmp/bedroom.mp4
+```
+
+The `webgpu` group installs osam's WebGPU plugin, `onnxruntime-ep-webgpu`, which runs every model on the GPU through Vulkan, Direct3D 12, or Metal. For video, use it over CoreML: CoreML can't compile the tracker's memory attention, whose input grows as frames fill the memory, so a frame takes 5.8 s against 6.7 s on an M5.
 
 **Check text-prompt scores against PyTorch on CPU**
 
@@ -132,6 +156,17 @@ uv run test_text_parity.py --apple-image /path/to/apple.jpg
 ```
 
 The check compares preprocessing, image and language features, and decoder scores for apples and `images/bus.jpg` with "person". It also feeds PyTorch features to the ONNX decoder to isolate decoder errors. Both pipelines must return the same detection count and sorted scores within 0.01. PIL bilinear resizing can differ from PyTorch's tensor resize by one uint8 level. This inference fix works with the existing models; no re-export or Hugging Face upload is needed.
+
+**Check video tracking against PyTorch on CUDA**
+
+```sh
+uv run test_video_parity.py
+uv run test_video_inference_parity.py
+```
+
+The check runs point, refinement, reverse, box, mask, two-object, and removal cases on the first 60 frames of `bedroom.mp4` with the PyTorch tracker in float32, and fails if a frame's mask IoU drops below 0.99.
+
+`test_video_inference_parity.py` checks `VideoInference` the same way against `build_sam3_video_model()`. It runs text and box prompts, forward and reverse, point refinement, an added object, and removal. It fails if the object ids differ, a mask IoU drops below 0.99, or a score differs by more than 0.01.
 
 ## Pre-exported ONNX models
 

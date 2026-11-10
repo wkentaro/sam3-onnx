@@ -16,6 +16,7 @@ from numpy.typing import NDArray
 from onnx import numpy_helper
 from osam._models.yoloworld.clip import tokenize
 from osam.types._model import _setup_cuda
+from osam.types._model import _webgpu_device
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,10 +64,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        choices=["cpu", "cuda", "coreml"],
+        choices=DEVICES,
         default="cpu",
-        help="Device to run the models on. cuda needs the gpu dependency group, "
-        "and coreml needs macOS.",
+        help=DEVICE_HELP,
     )
     args = parser.parse_args()
     logger.debug("input: {}", args.__dict__)
@@ -216,6 +216,28 @@ def run_point_decoder(
     return iou_predictions, low_res_masks
 
 
+def get_max_boxes(session: onnxruntime.InferenceSession) -> int:
+    (box_input,) = [i for i in session.get_inputs() if i.name == "box_coords"]
+    return box_input.shape[0]
+
+
+def make_box_inputs(
+    session: onnxruntime.InferenceSession,
+    boxes: typing.Sequence[typing.Sequence[float]],
+) -> dict[str, NDArray]:
+    """The decoder takes a fixed number of boxes, given as [cx, cy, w, h, label]
+    rows, and masks out the unused ones."""
+    max_boxes = get_max_boxes(session)
+    box_coords = np.zeros((max_boxes, 1, 4), dtype=np.float32)
+    box_labels = np.ones((max_boxes, 1), dtype=np.int64)
+    box_masks = np.ones((1, max_boxes), dtype=np.bool_)
+    for i, box in enumerate(boxes):
+        box_coords[i, 0] = box[:4]
+        box_labels[i, 0] = box[4]
+        box_masks[0, i] = False
+    return {"box_coords": box_coords, "box_labels": box_labels, "box_masks": box_masks}
+
+
 def load_for_coreml(onnx_file: str) -> bytes:
     """Rewrite Gemm(transB=0) to Gemm(transB=1) with W {N, K}.
 
@@ -239,6 +261,13 @@ def load_for_coreml(onnx_file: str) -> bytes:
         else:
             trans_b.i = 1
     return model.SerializeToString()
+
+
+DEVICES = ["cpu", "cuda", "coreml", "webgpu"]
+DEVICE_HELP = (
+    "Device to run the models on. cuda needs the gpu dependency group, coreml "
+    "needs macOS, and webgpu needs the webgpu dependency group."
+)
 
 
 def create_sessions(
@@ -275,6 +304,23 @@ def create_sessions(
         # ponytail: no ModelCacheDirectory, which saves 3 s of the compile but
         # stores another 3.5 GB keyed by model path; add it for long sessions.
         coreml_options = {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU"}
+    elif device == "webgpu":
+        # osam's onnxruntime-ep-webgpu plugin, on the adapter osam picks.
+        try:
+            webgpu_device = _webgpu_device()
+        except RuntimeError:  # the plugin is not installed
+            logger.error(
+                "WebGPU is unavailable, run with: "
+                "uv run --no-dev --group webgpu infer_onnx.py ..."
+            )
+            sys.exit(1)
+        if webgpu_device is None:
+            logger.error("WebGPU found no GPU adapter")
+            sys.exit(1)
+        # Unlike CoreML, it takes inputs whose shapes change, as the memory of
+        # the tracker does, so every model runs on the GPU.
+        sess_options.add_provider_for_devices([webgpu_device], {})
+        providers.insert(0, "WebGpuExecutionProvider")
     sessions: list[onnxruntime.InferenceSession] = []
     for name in names:
         # Only the image encoder: the decoders take longer to compile for CoreML
@@ -286,7 +332,10 @@ def create_sessions(
             # ponytail: rewritten on every run (~2 s); cache it if that matters.
             model = load_for_coreml(model)
         session = onnxruntime.InferenceSession(
-            model, sess_options, providers=session_providers
+            model,
+            sess_options,
+            # A plugin provider comes from sess_options, by device.
+            providers=None if device == "webgpu" else session_providers,
         )
         # onnxruntime silently falls back to CPU for a provider it can't use.
         (provider, *_) = session_providers
@@ -387,22 +436,14 @@ def main():
     logger.debug("finished running language encoder")
 
     logger.debug("running decoder...")
-    # The decoder takes a fixed number of boxes, and masks out the unused ones.
     box_prompt: list[list[float]] = args.box_prompt or []
-    (box_input,) = [i for i in sess_decode.get_inputs() if i.name == "box_coords"]
-    max_boxes: int = box_input.shape[0]
+    max_boxes = get_max_boxes(sess_decode)
     if len(box_prompt) > max_boxes:
         logger.error("box_prompt must have at most {} boxes", max_boxes)
         sys.exit(1)
-    box_coords: NDArray[np.float32] = np.zeros((max_boxes, 1, 4), dtype=np.float32)
-    box_labels: NDArray[np.int64] = np.ones((max_boxes, 1), dtype=np.int64)
-    box_masks: NDArray[np.bool_] = np.ones((1, max_boxes), dtype=np.bool_)
-    for i, box in enumerate(box_prompt):
-        box_coords[i, 0] = box[:4]
-        box_labels[i, 0] = box[4]
-        box_masks[0, i] = False
+    box_inputs = make_box_inputs(sess_decode, box_prompt)
     output = sess_decode.run(
-        None,
+        ["boxes", "scores", "masks"],
         {
             "backbone_fpn_0": backbone_fpn[0],
             "backbone_fpn_1": backbone_fpn[1],
@@ -410,9 +451,7 @@ def main():
             "vision_pos_enc_2": vision_pos_enc[2],
             "language_mask": language_mask,
             "language_features": language_features,
-            "box_coords": box_coords,
-            "box_labels": box_labels,
-            "box_masks": box_masks,
+            **box_inputs,
         },
     )
     assert len(output) == 3
