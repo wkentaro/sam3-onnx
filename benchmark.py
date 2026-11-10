@@ -31,6 +31,7 @@ import numpy as np
 import PIL.Image
 
 from infer_onnx import DEVICES
+from infer_onnx import FP16_HELP
 
 TEXT: str = "person"
 # On images/bus.jpg, normalized: a box (cx, cy, w, h) and a point on a person.
@@ -133,7 +134,9 @@ def run_onnx(args: argparse.Namespace, paths: list[pathlib.Path]) -> dict:
 
     names = ["image_encoder", *video_onnx.MODEL_NAMES]
     start = time.perf_counter()
-    sessions = dict(zip(names, create_sessions(device=args.device, names=names)))
+    sessions = dict(
+        zip(names, create_sessions(device=args.device, names=names, fp16=args.fp16))
+    )
     result: dict[str, typing.Any] = {"load_s": round(time.perf_counter() - start, 1)}
     timings: Timings = collections.defaultdict(list)
     for name, session in sessions.items():
@@ -373,6 +376,7 @@ def main() -> None:
         help="Device of --runtime onnx, as infer_onnx.py takes. --runtime torch "
         "runs on CUDA.",
     )
+    parser.add_argument("--fp16", action="store_true", help=FP16_HELP)
     parser.add_argument("--image", type=pathlib.Path, default="images/bus.jpg")
     parser.add_argument("--image-runs", type=int, default=5)
     parser.add_argument(
@@ -387,7 +391,9 @@ def main() -> None:
     run = run_torch if args.runtime == "torch" else run_onnx
     result: dict[str, typing.Any] = {"runtime": args.runtime}
     if args.runtime == "onnx":
-        result["device"] = args.device
+        result.update(device=args.device, fp16=args.fp16)
+    elif args.fp16:
+        parser.error("--fp16 is for --runtime onnx")
     result.update(run(args, paths))
     print(json.dumps(result, indent=2))
 

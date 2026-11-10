@@ -132,6 +132,8 @@ The v0.6.0 models predate video tracking. Create the tracker models and the upda
 UV_PROJECT_ENVIRONMENT=.venv-gpu uv run --no-dev --no-group cpu --group gpu infer_onnx.py --image images/bus.jpg --text-prompt person --device cuda
 ```
 
+Add `--fp16` to run the float16 models, which `uv run postprocess_onnx.py --fp16 models/*.onnx` writes. On an RTX 3080 Ti they track a video frame in 229 ms against 400 ms, with the same detections and masks within the difference that PyTorch has between bfloat16 and float32. `--fp16` works with `--device cuda`, `webgpu`, and `coreml`, and leaves the models that run on the CPU in float32.
+
 The `gpu` group installs `onnxruntime-gpu` with its CUDA and cuDNN libraries, so no system CUDA install is needed. Keep it in its own environment without the dev group: onnxruntime and onnxruntime-gpu overwrite each other's files, and so do the cuDNN libraries of torch and onnxruntime-gpu.
 
 **Inference with onnx on Apple GPU (macOS)**

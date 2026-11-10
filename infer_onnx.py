@@ -68,6 +68,7 @@ def parse_args() -> argparse.Namespace:
         default="cpu",
         help=DEVICE_HELP,
     )
+    parser.add_argument("--fp16", action="store_true", help=FP16_HELP)
     args = parser.parse_args()
     logger.debug("input: {}", args.__dict__)
 
@@ -270,9 +271,28 @@ DEVICE_HELP = (
 )
 
 
+FP16_HELP = (
+    "Run the float16 models of postprocess_onnx.py --fp16 on the GPU, which is "
+    "up to twice as fast. Models that --device leaves on the CPU stay float32."
+)
+
+
+def model_file(name: str, device: str, fp16: bool) -> str:
+    """The float16 copy for a model that the device runs on a GPU, where it
+    is faster. On a CPU it is slower than float32, which has more kernels."""
+    on_gpu = device in ("cuda", "webgpu") or (
+        # See create_sessions for why CoreML runs this model alone.
+        device == "coreml" and name == "image_encoder"
+    )
+    return f"models/sam3_{name}{'_fp16' if fp16 and on_gpu else ''}.onnx"
+
+
 def create_sessions(
-    device: str, names: list[str]
+    device: str, names: list[str], fp16: bool = False
 ) -> list[onnxruntime.InferenceSession]:
+    if fp16 and device == "cpu":
+        logger.error("--fp16 needs a GPU: --device cuda, coreml, or webgpu")
+        sys.exit(1)
     providers: list[str] = ["CPUExecutionProvider"]
     coreml_options: dict[str, str] | None = None
     sess_options = onnxruntime.SessionOptions()  # type: ignore[possibly-missing-attribute]
@@ -326,7 +346,13 @@ def create_sessions(
         # Only the image encoder: the decoders take longer to compile for CoreML
         # than it saves them.
         session_providers: list[str | tuple[str, dict[str, str]]] = [*providers]
-        model: str | bytes = f"models/sam3_{name}.onnx"
+        model: str | bytes = model_file(name, device, fp16)
+        if not pathlib.Path(model).exists():
+            hint = (
+                "postprocess_onnx.py --fp16 models/*.onnx" if fp16 else "export_onnx.py"
+            )
+            logger.error("{} is missing, create it with: uv run {}", model, hint)
+            sys.exit(1)
         if coreml_options is not None and name == "image_encoder":
             session_providers.insert(0, ("CoreMLExecutionProvider", coreml_options))
             # ponytail: rewritten on every run (~2 s); cache it if that matters.
@@ -356,7 +382,7 @@ def main():
     if args.litetext and not args.point_prompt:
         decoder_names[0] = f"litetext_{args.litetext}_language_encoder"
     sess_image, *sess_decoders = create_sessions(
-        device=args.device, names=["image_encoder", *decoder_names]
+        device=args.device, names=["image_encoder", *decoder_names], fp16=args.fp16
     )
     logger.debug("providers: {}", sess_image.get_providers())
 

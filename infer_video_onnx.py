@@ -14,6 +14,7 @@ from numpy.typing import NDArray
 import video_onnx
 from infer_onnx import DEVICE_HELP
 from infer_onnx import DEVICES
+from infer_onnx import FP16_HELP
 from infer_onnx import create_sessions
 from track_onnx import MODEL_NAMES
 from track_onnx import Tracker
@@ -56,6 +57,7 @@ def parse_args() -> argparse.Namespace:
         default="cpu",
         help=DEVICE_HELP,
     )
+    parser.add_argument("--fp16", action="store_true", help=FP16_HELP)
     args = parser.parse_args()
     logger.debug("input: {}", args.__dict__)
 
@@ -99,7 +101,9 @@ def main() -> None:
 
     model_names = MODEL_NAMES if args.text_prompt is None else video_onnx.MODEL_NAMES
     names = ["image_encoder", *model_names]
-    sessions = dict(zip(names, create_sessions(device=args.device, names=names)))
+    sessions = dict(
+        zip(names, create_sessions(device=args.device, names=names, fp16=args.fp16))
+    )
 
     frames, fps = read_video(args.video)
     if not frames:
