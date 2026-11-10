@@ -4,6 +4,7 @@ from unittest.mock import patch
 import numpy as np
 
 from infer_onnx import main
+from infer_onnx import model_device
 from infer_onnx import model_file
 from infer_onnx import parse_args
 from infer_onnx import run_point_decoder
@@ -39,16 +40,23 @@ def test_language_encoder_selection() -> None:
 
 def test_model_file() -> None:
     assert model_file("decoder", "cuda", fp16=False) == "models/sam3_decoder.onnx"
-    for device in ["cuda", "webgpu"]:
+    for device in ["cuda", "webgpu", "coreml"]:
         assert (
             model_file("decoder", device, fp16=True) == "models/sam3_decoder_fp16.onnx"
         )
-    # CoreML runs the image encoder alone, and the CPU the rest in float32.
-    assert (
-        model_file("image_encoder", "coreml", fp16=True)
-        == "models/sam3_image_encoder_fp16.onnx"
-    )
-    assert model_file("decoder", "coreml", fp16=True) == "models/sam3_decoder.onnx"
+    # A model that the CPU runs stays float32.
+    assert model_file("decoder", "cpu", fp16=True) == "models/sam3_decoder.onnx"
+
+
+def test_model_device() -> None:
+    for device in ["cpu", "cuda", "webgpu"]:
+        for name in ["image_encoder", "decoder"]:
+            assert model_device(name, device, has_webgpu=False) == device
+    # CoreML runs the image encoder alone.
+    for has_webgpu in [False, True]:
+        assert model_device("image_encoder", "coreml", has_webgpu) == "coreml"
+    assert model_device("memory_attention", "coreml", has_webgpu=True) == "webgpu"
+    assert model_device("memory_attention", "coreml", has_webgpu=False) == "cpu"
 
 
 def test_parse_box_prompt() -> None:
@@ -103,6 +111,7 @@ def test_single_mask() -> None:
 if __name__ == "__main__":
     test_language_encoder_selection()
     test_model_file()
+    test_model_device()
     test_parse_box_prompt()
     test_single_mask()
     print("ok")

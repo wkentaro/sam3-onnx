@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import functools
 import pathlib
 import sys
 import typing
@@ -282,7 +283,9 @@ POINT_DECODER_FEATURES: list[str] = [
 DEVICES = ["cpu", "cuda", "coreml", "webgpu"]
 DEVICE_HELP = (
     "Device to run the models on. cuda needs the gpu dependency group, coreml "
-    "needs macOS, and webgpu needs the webgpu dependency group."
+    "needs macOS, and webgpu needs the webgpu dependency group. coreml runs the "
+    "image encoder, and the other models on WebGPU with the webgpu group "
+    "installed, or else on the CPU."
 )
 
 
@@ -292,24 +295,39 @@ FP16_HELP = (
 )
 
 
+def model_device(name: str, device: str, has_webgpu: bool) -> str:
+    """The device that runs one model.
+
+    With coreml, CoreML runs the image encoder alone: it runs it 3 times as
+    fast as WebGPU does on an Apple GPU, but it can't compile the tracker's
+    memory attention, whose input grows as frames fill the memory, and the
+    decoders take longer to compile than it saves them. WebGPU runs those
+    when its plugin is installed, and the CPU otherwise.
+    """
+    if device != "coreml" or name == "image_encoder":
+        return device
+    return "webgpu" if has_webgpu else "cpu"
+
+
 def model_file(name: str, device: str, fp16: bool) -> str:
-    """The float16 copy for a model that the device runs on a GPU, where it
-    is faster. On a CPU it is slower than float32, which has more kernels."""
-    on_gpu = device in ("cuda", "webgpu") or (
-        # See create_sessions for why CoreML runs this model alone.
-        device == "coreml" and name == "image_encoder"
-    )
-    return f"models/sam3_{name}{'_fp16' if fp16 and on_gpu else ''}.onnx"
+    """The float16 copy for a model that runs on a GPU, where it is faster.
+    On a CPU it is slower than float32, which has more kernels."""
+    return f"models/sam3_{name}{'_fp16' if fp16 and device != 'cpu' else ''}.onnx"
 
 
-def create_sessions(
-    device: str, names: list[str], fp16: bool = False
-) -> list[onnxruntime.InferenceSession]:
-    if fp16 and device == "cpu":
-        logger.error("--fp16 needs a GPU: --device cuda, coreml, or webgpu")
-        sys.exit(1)
-    providers: list[str] = ["CPUExecutionProvider"]
-    coreml_options: dict[str, str] | None = None
+def _has_webgpu() -> bool:
+    try:
+        return _webgpu_device() is not None
+    except RuntimeError:  # the plugin is not installed
+        return False
+
+
+@functools.cache
+def _session_options(
+    device: str,
+) -> tuple[typing.Any, list[str | tuple[str, dict[str, str]]]]:
+    """The session options and providers that run a model on a device."""
+    providers: list[str | tuple[str, dict[str, str]]] = ["CPUExecutionProvider"]
     sess_options = onnxruntime.SessionOptions()  # type: ignore[possibly-missing-attribute]
     if device == "cuda":
         # Loads the CUDA libraries of osam[gpu] and shares one CUDA arena across
@@ -339,6 +357,7 @@ def create_sessions(
         # ponytail: no ModelCacheDirectory, which saves 3 s of the compile but
         # stores another 3.5 GB keyed by model path; add it for long sessions.
         coreml_options = {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU"}
+        providers.insert(0, ("CoreMLExecutionProvider", coreml_options))
     elif device == "webgpu":
         # osam's onnxruntime-ep-webgpu plugin, on the adapter osam picks.
         try:
@@ -353,37 +372,46 @@ def create_sessions(
             logger.error("WebGPU found no GPU adapter")
             sys.exit(1)
         # Unlike CoreML, it takes inputs whose shapes change, as the memory of
-        # the tracker does, so every model runs on the GPU.
+        # the tracker does.
         sess_options.add_provider_for_devices([webgpu_device], {})
         providers.insert(0, "WebGpuExecutionProvider")
+    return sess_options, providers
+
+
+def create_sessions(
+    device: str, names: list[str], fp16: bool = False
+) -> list[onnxruntime.InferenceSession]:
+    if fp16 and device == "cpu":
+        logger.error("--fp16 needs a GPU: --device cuda, coreml, or webgpu")
+        sys.exit(1)
+    has_webgpu = device == "coreml" and _has_webgpu()
     sessions: list[onnxruntime.InferenceSession] = []
     for name in names:
-        # Only the image encoder: the decoders take longer to compile for CoreML
-        # than it saves them.
-        session_providers: list[str | tuple[str, dict[str, str]]] = [*providers]
-        model: str | bytes = model_file(name, device, fp16)
+        device_of_model = model_device(name, device, has_webgpu)
+        sess_options, providers = _session_options(device_of_model)
+        model: str | bytes = model_file(name, device_of_model, fp16)
         if not pathlib.Path(model).exists():
             hint = (
                 "postprocess_onnx.py --fp16 models/*.onnx" if fp16 else "export_onnx.py"
             )
             logger.error("{} is missing, create it with: uv run {}", model, hint)
             sys.exit(1)
-        if coreml_options is not None and name == "image_encoder":
-            session_providers.insert(0, ("CoreMLExecutionProvider", coreml_options))
+        if device_of_model == "coreml":
             # ponytail: rewritten on every run (~2 s); cache it if that matters.
             model = load_for_coreml(model)
         session = onnxruntime.InferenceSession(
             model,
             sess_options,
             # A plugin provider comes from sess_options, by device.
-            providers=None if device == "webgpu" else session_providers,
+            providers=None if device_of_model == "webgpu" else providers,
         )
         # onnxruntime silently falls back to CPU for a provider it can't use.
-        (provider, *_) = session_providers
+        (provider, *_) = providers
         provider = provider if isinstance(provider, str) else provider[0]
         if provider not in session.get_providers():
             logger.error("{} is not running on {}", name, provider)
             sys.exit(1)
+        logger.debug("{} runs on {}", name, provider)
         sessions.append(session)
     return sessions
 
