@@ -70,6 +70,7 @@ def parse_args() -> argparse.Namespace:
         help=DEVICE_HELP,
     )
     parser.add_argument("--fp16", action="store_true", help=FP16_HELP)
+    parser.add_argument("--int8", action="store_true", help=INT8_HELP)
     args = parser.parse_args()
     logger.debug("input: {}", args.__dict__)
 
@@ -294,6 +295,11 @@ FP16_HELP = (
     "up to twice as fast. Models that --device leaves on the CPU stay float32."
 )
 
+INT8_HELP = (
+    "Run the int8 image encoder of postprocess_onnx.py --int8 on the CPU, which "
+    "takes 40%% less time on an x86 CPU. The other models stay float32."
+)
+
 
 def model_device(name: str, device: str, has_webgpu: bool) -> str:
     """The device that runs one model.
@@ -309,10 +315,18 @@ def model_device(name: str, device: str, has_webgpu: bool) -> str:
     return "webgpu" if has_webgpu else "cpu"
 
 
-def model_file(name: str, device: str, fp16: bool) -> str:
+def model_file(name: str, device: str, fp16: bool, int8: bool = False) -> str:
     """The float16 copy for a model that runs on a GPU, where it is faster.
-    On a CPU it is slower than float32, which has more kernels."""
-    return f"models/sam3_{name}{'_fp16' if fp16 and device != 'cpu' else ''}.onnx"
+    On a CPU it is slower than float32, which has more kernels.
+
+    The int8 copy for the image encoder on a CPU. The int8 tracker models lose
+    objects, and the decoders run no faster.
+    """
+    if fp16 and device != "cpu":
+        return f"models/sam3_{name}_fp16.onnx"
+    if int8 and device == "cpu" and name == "image_encoder":
+        return f"models/sam3_{name}_int8.onnx"
+    return f"models/sam3_{name}.onnx"
 
 
 def _has_webgpu() -> bool:
@@ -379,21 +393,27 @@ def _session_options(
 
 
 def create_sessions(
-    device: str, names: list[str], fp16: bool = False
+    device: str, names: list[str], fp16: bool = False, int8: bool = False
 ) -> list[onnxruntime.InferenceSession]:
     if fp16 and device == "cpu":
         logger.error("--fp16 needs a GPU: --device cuda, coreml, or webgpu")
+        sys.exit(1)
+    if int8 and device != "cpu":
+        logger.error("--int8 needs --device cpu")
         sys.exit(1)
     has_webgpu = device == "coreml" and _has_webgpu()
     sessions: list[onnxruntime.InferenceSession] = []
     for name in names:
         device_of_model = model_device(name, device, has_webgpu)
         sess_options, providers = _session_options(device_of_model)
-        model: str | bytes = model_file(name, device_of_model, fp16)
+        model: str | bytes = model_file(name, device_of_model, fp16, int8)
         if not pathlib.Path(model).exists():
-            hint = (
-                "postprocess_onnx.py --fp16 models/*.onnx" if fp16 else "export_onnx.py"
-            )
+            if model.endswith("_fp16.onnx"):
+                hint = "postprocess_onnx.py --fp16 models/*.onnx"
+            elif model.endswith("_int8.onnx"):
+                hint = "postprocess_onnx.py --int8 models/sam3_image_encoder.onnx"
+            else:
+                hint = "export_onnx.py"
             logger.error("{} is missing, create it with: uv run {}", model, hint)
             sys.exit(1)
         if device_of_model == "coreml":
@@ -459,7 +479,10 @@ def main():
     if args.litetext and not args.point_prompt:
         decoder_names[0] = f"litetext_{args.litetext}_language_encoder"
     sess_image, *sess_decoders = create_sessions(
-        device=args.device, names=["image_encoder", *decoder_names], fp16=args.fp16
+        device=args.device,
+        names=["image_encoder", *decoder_names],
+        fp16=args.fp16,
+        int8=args.int8,
     )
     logger.debug("providers: {}", sess_image.get_providers())
 

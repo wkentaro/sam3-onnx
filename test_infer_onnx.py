@@ -37,7 +37,10 @@ def test_language_encoder_selection() -> None:
                 else "language_encoder"
             )
             create.assert_called_once_with(
-                device="cpu", names=["image_encoder", language, "decoder"], fp16=False
+                device="cpu",
+                names=["image_encoder", language, "decoder"],
+                fp16=False,
+                int8=False,
             )
 
 
@@ -49,6 +52,14 @@ def test_model_file() -> None:
         )
     # A model that the CPU runs stays float32.
     assert model_file("decoder", "cpu", fp16=True) == "models/sam3_decoder.onnx"
+    # The CPU runs the int8 image encoder alone.
+    assert (
+        model_file("image_encoder", "cpu", fp16=False, int8=True)
+        == "models/sam3_image_encoder_int8.onnx"
+    )
+    assert model_file("decoder", "cpu", fp16=False, int8=True) == (
+        "models/sam3_decoder.onnx"
+    )
 
 
 def test_model_device() -> None:
