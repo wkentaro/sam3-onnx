@@ -22,6 +22,8 @@ import PIL.Image
 from numpy.typing import NDArray
 from osam._models.yoloworld.clip import tokenize
 
+from infer_onnx import DECODER_FEATURES
+from infer_onnx import POINT_DECODER_FEATURES
 from infer_onnx import make_box_inputs
 from infer_onnx import preprocess_image
 from track_onnx import INPUT_MASK_SIZE
@@ -59,12 +61,11 @@ def encode_frame(
     session: onnxruntime.InferenceSession, frame: NDArray[np.uint8]
 ) -> dict[str, NDArray]:
     """Run the image encoder on an RGB frame (H, W, 3) for VideoInference."""
-    outputs = session.run(None, {"image": preprocess_image(PIL.Image.fromarray(frame))})
-    return dict(
-        zip(
-            [o.name for o in session.get_outputs()], typing.cast(list[NDArray], outputs)
-        )
+    names = [*DECODER_FEATURES, *POINT_DECODER_FEATURES]
+    outputs = session.run(
+        names, {"image": preprocess_image(PIL.Image.fromarray(frame))}
     )
+    return dict(zip(names, typing.cast(list[NDArray], outputs)))
 
 
 def _mask_iou(a: NDArray[np.bool_], b: NDArray[np.bool_]) -> NDArray[np.float32]:
@@ -216,10 +217,7 @@ class VideoInference:
 
     def _tracker_features(self, frame_idx: int) -> list[NDArray]:
         features = self._features(frame_idx)
-        return [
-            features[name]
-            for name in ["image_embeddings", "high_res_features1", "high_res_features2"]
-        ]
+        return [features[name] for name in POINT_DECODER_FEATURES]
 
     def _new_tracker(self) -> Tracker:
         return Tracker(
@@ -252,10 +250,7 @@ class VideoInference:
         probs, mask_logits = session.run(
             ["scores", "mask_logits"],
             {
-                **{
-                    f"backbone_fpn_{i}": features[f"backbone_fpn_{i}"] for i in range(3)
-                },
-                "vision_pos_enc_2": features["vision_pos_enc_2"],
+                **{name: features[name] for name in DECODER_FEATURES},
                 **self._language_features,
                 **make_box_inputs(session, boxes),
             },

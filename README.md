@@ -53,6 +53,9 @@ uv run export_onnx.py
 # or convert models from an older export in place, as export_onnx.py does
 uv run postprocess_onnx.py models/*.onnx && rm models/*.onnx.data
 
+# write float16 copies for GPUs, as models/*_fp16.onnx
+uv run postprocess_onnx.py --fp16 models/*.onnx
+
 # upload to Hugging Face Hub
 # uvx hf upload wkentaro/sam3-onnx-models-v0.6.0 models/ --include '*.onnx'
 ```
@@ -129,15 +132,17 @@ The v0.6.0 models predate video tracking. Create the tracker models and the upda
 UV_PROJECT_ENVIRONMENT=.venv-gpu uv run --no-dev --no-group cpu --group gpu infer_onnx.py --image images/bus.jpg --text-prompt person --device cuda
 ```
 
+Add `--fp16` to run the float16 models, which `uv run postprocess_onnx.py --fp16 models/*.onnx` writes. On an RTX 3080 Ti they track a video frame in 229 ms against 400 ms, with the same detections and masks within the difference that PyTorch has between bfloat16 and float32. `--fp16` works with `--device cuda`, `webgpu`, and `coreml`, and leaves the models that run on the CPU in float32.
+
 The `gpu` group installs `onnxruntime-gpu` with its CUDA and cuDNN libraries, so no system CUDA install is needed. Keep it in its own environment without the dev group: onnxruntime and onnxruntime-gpu overwrite each other's files, and so do the cuDNN libraries of torch and onnxruntime-gpu.
 
 **Inference with onnx on Apple GPU (macOS)**
 
 ```sh
-uv run --no-dev infer_onnx.py --image images/bus.jpg --text-prompt person --device coreml
+uv run --no-dev --group webgpu infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --text-prompt person --device coreml --fp16 --output /tmp/bedroom.mp4
 ```
 
-The image encoder runs on the GPU through CoreML, over twice as fast as on CPU (2.5 s against 6 s on an M5). The other models stay on CPU, where they take under 2 s.
+`--device coreml` runs the image encoder on the GPU through CoreML, 3 times as fast as WebGPU runs it. CoreML can't compile the tracker's memory attention, whose input grows as frames fill the memory, so the other models run on WebGPU when the `webgpu` group is installed, and on the CPU without it. With `--fp16` on an M5, a text prompt on an image takes 1.2 s and a tracked video frame of one object takes 1.2 s.
 
 **Inference with onnx on WebGPU (macOS, Linux, Windows)**
 
@@ -145,7 +150,7 @@ The image encoder runs on the GPU through CoreML, over twice as fast as on CPU (
 uv run --no-dev --group webgpu infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --text-prompt person --device webgpu --output /tmp/bedroom.mp4
 ```
 
-The `webgpu` group installs osam's WebGPU plugin, `onnxruntime-ep-webgpu`, which runs every model on the GPU through Vulkan, Direct3D 12, or Metal. For video, use it over CoreML: CoreML can't compile the tracker's memory attention, whose input grows as frames fill the memory, so a frame takes 5.8 s against 6.7 s on an M5.
+The `webgpu` group installs osam's WebGPU plugin, `onnxruntime-ep-webgpu`, which runs every model on the GPU through Vulkan, Direct3D 12, or Metal. On macOS, prefer `--device coreml` above.
 
 **Check text-prompt scores against PyTorch on CPU**
 
@@ -167,6 +172,15 @@ uv run test_video_inference_parity.py
 The check runs point, refinement, reverse, box, mask, two-object, and removal cases on the first 60 frames of `bedroom.mp4` with the PyTorch tracker in float32, and fails if a frame's mask IoU drops below 0.99.
 
 `test_video_inference_parity.py` checks `VideoInference` the same way against `build_sam3_video_model()`. It runs text and box prompts, forward and reverse, point refinement, an added object, and removal. It fails if the object ids differ, a mask IoU drops below 0.99, or a score differs by more than 0.01.
+
+**Compare speed with PyTorch**
+
+```sh
+uv run benchmark.py --runtime torch
+UV_PROJECT_ENVIRONMENT=.venv-gpu uv run --no-dev --no-group cpu --group gpu benchmark.py --device cuda
+```
+
+`benchmark.py` runs text, box, and point prompts on `images/bus.jpg`, then point, box, and text prompts through 40 frames of `bedroom.mp4`. It prints the mean time of each model and of the whole in milliseconds, per image or per tracked frame. Each case runs once untimed first. A frame's time runs from the JPEG files of the video to the masks of its last frame, over the frame count, so it holds loading the frames in both runtimes. Compare the totals across runtimes: a model's time on the PyTorch side is that of the nearest module, which does less than the ONNX model. `--runtime torch` runs upstream as it ships, in bfloat16 on CUDA. `--device` takes the same values as `infer_onnx.py`.
 
 ## Pre-exported ONNX models
 

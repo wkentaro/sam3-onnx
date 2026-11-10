@@ -6,6 +6,7 @@ import pathlib
 import numpy as np
 import onnx
 from loguru import logger
+from onnx import TensorProto
 from onnx import helper
 from onnx import numpy_helper
 
@@ -188,6 +189,151 @@ def postprocess(onnx_file: pathlib.Path) -> None:
     logger.debug("postprocessed onnx model: {!r}", str(onnx_file))
 
 
+_INTEGERS: frozenset[int] = frozenset(
+    {
+        TensorProto.INT8,
+        TensorProto.INT16,
+        TensorProto.INT32,
+        TensorProto.INT64,
+        TensorProto.UINT8,
+        TensorProto.UINT16,
+        TensorProto.UINT32,
+        TensorProto.UINT64,
+    }
+)
+
+
+def convert_float16(onnx_file: pathlib.Path, output_file: pathlib.Path) -> None:
+    """Write a copy of the model that computes in float16, for GPUs.
+
+    Its inputs and outputs stay float32, so callers run it like the original.
+    It halves the file and the memory it takes, and runs up to twice as fast
+    on a GPU. CPUs lack float16 kernels, so keep the original for them.
+    """
+    model: onnx.ModelProto = onnx.load(onnx_file)
+    graph: onnx.GraphProto = model.graph
+    if any(a.g.node or a.graphs for n in graph.node for a in n.attribute):
+        raise ValueError(f"{onnx_file} has a subgraph, which is not converted")
+
+    # ONNX defines the scales of Resize for float32 alone.
+    float32_only: set[str] = {
+        n.input[2]
+        for n in graph.node
+        if n.op_type == "Resize" and len(n.input) > 2 and n.input[2]
+    }
+
+    def convert(tensor: onnx.TensorProto) -> None:
+        if tensor.data_type != TensorProto.FLOAT:
+            return
+        value = numpy_helper.to_array(tensor)
+        # Keep a large finite value, like an attention mask's, from becoming inf.
+        limit = np.finfo(np.float16).max
+        clipped = np.where(np.isfinite(value), np.clip(value, -limit, limit), value)
+        tensor.CopyFrom(
+            numpy_helper.from_array(clipped.astype(np.float16), tensor.name)
+        )
+
+    types: dict[str, int] = {
+        value.name: value.type.tensor_type.elem_type
+        for value in [
+            *graph.input,
+            *onnx.shape_inference.infer_shapes(model).graph.value_info,
+            *graph.output,
+        ]
+    }
+    types.update({tensor.name: tensor.data_type for tensor in graph.initializer})
+
+    for tensor in graph.initializer:
+        if tensor.name not in float32_only:
+            convert(tensor)
+    # A count of pixels can pass 65504, the largest float16. So an integer cast
+    # to float stays float32 through the nodes that take such values alone,
+    # like the division of two counts, and becomes float16 where it meets
+    # another float.
+    float32_values: set[str] = set()
+    nodes: list[onnx.NodeProto] = []
+    for node in graph.node:
+        to = next((a for a in node.attribute if a.name == "to"), None)
+        float_inputs = [i for i in node.input if types.get(i) == TensorProto.FLOAT]
+        if (
+            node.op_type == "Cast"
+            and to is not None
+            and to.i == TensorProto.FLOAT
+            and types.get(node.input[0]) in _INTEGERS
+        ):
+            float32_values.add(node.output[0])
+        elif float_inputs and all(i in float32_values for i in float_inputs):
+            float32_values.update(
+                o for o in node.output if types.get(o) == TensorProto.FLOAT
+            )
+        else:
+            for index, name in enumerate(node.input):
+                if name not in float32_values:
+                    continue
+                half = f"{name}_half"
+                if half not in types:
+                    types[half] = TensorProto.FLOAT16
+                    nodes.append(
+                        helper.make_node(
+                            "Cast", [name], [half], name=half, to=TensorProto.FLOAT16
+                        )
+                    )
+                node.input[index] = half
+            if node.op_type == "Cast" and to is not None:
+                if to.i == TensorProto.FLOAT:
+                    to.i = TensorProto.FLOAT16
+            elif node.op_type in ("Constant", "ConstantOfShape"):
+                if node.op_type == "Constant" and node.output[0] in float32_only:
+                    pass
+                elif any(
+                    a.name in ("value_float", "value_floats") for a in node.attribute
+                ):
+                    raise ValueError(f"{node.name} holds a float outside a tensor")
+                else:
+                    for attribute in node.attribute:
+                        if attribute.name == "value":
+                            convert(attribute.t)
+        nodes.append(node)
+    del graph.node[:]
+    graph.node.extend(nodes)
+
+    def rename(old: str, new: str) -> None:
+        for node in graph.node:
+            node.input[:] = [new if name == old else name for name in node.input]
+            node.output[:] = [new if name == old else name for name in node.output]
+
+    casts_in: list[onnx.NodeProto] = []
+    for value in graph.input:
+        if value.type.tensor_type.elem_type == TensorProto.FLOAT:
+            name = f"{value.name}_float16"
+            rename(value.name, name)
+            casts_in.append(
+                helper.make_node(
+                    "Cast", [value.name], [name], name=name, to=TensorProto.FLOAT16
+                )
+            )
+    casts_out: list[onnx.NodeProto] = []
+    for value in graph.output:
+        if value.type.tensor_type.elem_type == TensorProto.FLOAT:
+            name = f"{value.name}_float16"
+            rename(value.name, name)
+            casts_out.append(
+                helper.make_node(
+                    "Cast", [name], [value.name], name=name, to=TensorProto.FLOAT
+                )
+            )
+    nodes = [*casts_in, *graph.node, *casts_out]
+    del graph.node[:]
+    graph.node.extend(nodes)
+    # The recorded types no longer hold; onnxruntime infers them on load.
+    del graph.value_info[:]
+
+    # Raises for an operator that ONNX does not define for float16.
+    onnx.shape_inference.infer_shapes(model, check_type=True, strict_mode=True)
+    onnx.save(model, output_file)
+    logger.debug("converted to float16: {!r}", str(output_file))
+
+
 def _static_shapes(model: onnx.ModelProto) -> dict[str, list[int]]:
     graph: onnx.GraphProto = onnx.shape_inference.infer_shapes(
         model, data_prop=True
@@ -211,8 +357,20 @@ def _all_nodes(graph: onnx.GraphProto):
 def main() -> None:
     parser = argparse.ArgumentParser(description=postprocess.__doc__)
     parser.add_argument("onnx_files", type=pathlib.Path, nargs="+")
-    for onnx_file in parser.parse_args().onnx_files:
-        postprocess(onnx_file)
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Instead, write a float16 copy for GPUs next to each file, "
+        "as <name>_fp16.onnx.",
+    )
+    args = parser.parse_args()
+    for onnx_file in args.onnx_files:
+        if not args.fp16:
+            postprocess(onnx_file)
+        elif not onnx_file.stem.endswith("_fp16"):
+            convert_float16(
+                onnx_file, onnx_file.with_name(f"{onnx_file.stem}_fp16.onnx")
+            )
 
 
 if __name__ == "__main__":

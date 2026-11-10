@@ -7,8 +7,10 @@ import onnxruntime
 from onnx import TensorProto
 from onnx import helper
 from onnx import numpy_helper
+from onnx.reference import ReferenceEvaluator
 
 from infer_onnx import load_for_coreml
+from postprocess_onnx import convert_float16
 from postprocess_onnx import postprocess
 
 
@@ -145,6 +147,145 @@ def test_postprocess() -> None:
                 assert len(constants[node.input[1]]) <= 5
 
 
+def test_convert_float16() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = pathlib.Path(tmp_dir)
+        rng = np.random.default_rng(0)
+        graph = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["x", "w"], ["m"], name="matmul"),
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["b"],
+                    name="constant",
+                    value=numpy_helper.from_array(
+                        np.array([0.5, -0.25, 1e9], np.float32)
+                    ),
+                ),
+                helper.make_node("Min", ["m", "b"], ["clipped"], name="min"),
+                helper.make_node(
+                    "Cast", ["i"], ["i_float"], name="cast", to=TensorProto.FLOAT
+                ),
+                helper.make_node("Add", ["clipped", "i_float"], ["y"], name="add"),
+                helper.make_node("ArgMax", ["y"], ["y_int"], name="argmax", axis=1),
+                # The scales of Resize stay float32, and its data becomes float16.
+                helper.make_node(
+                    "Resize", ["image", "", "scales"], ["resized"], name="resize"
+                ),
+            ],
+            "test",
+            [
+                helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 4]),
+                helper.make_tensor_value_info("i", TensorProto.INT64, [2, 3]),
+                helper.make_tensor_value_info("image", TensorProto.FLOAT, [1, 1, 2, 2]),
+            ],
+            [
+                helper.make_tensor_value_info("y", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("y_int", TensorProto.INT64, None),
+                helper.make_tensor_value_info("resized", TensorProto.FLOAT, None),
+            ],
+            [
+                numpy_helper.from_array(rng.random((4, 3), dtype=np.float32), "w"),
+                numpy_helper.from_array(np.array([1, 1, 2, 2], np.float32), "scales"),
+            ],
+        )
+        model = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 21)], ir_version=10
+        )
+        onnx_file = tmp_path / "model.onnx"
+        fp16_file = tmp_path / "model_fp16.onnx"
+        onnx.save(model, onnx_file)
+        feeds = {
+            "x": rng.random((2, 4), dtype=np.float32),
+            "i": rng.integers(0, 10, (2, 3)),
+            "image": rng.random((1, 1, 2, 2), dtype=np.float32),
+        }
+        expected = onnxruntime.InferenceSession(onnx_file).run(None, feeds)
+
+        convert_float16(onnx_file, fp16_file)
+
+        # The same inputs and outputs, in float32.
+        session = onnxruntime.InferenceSession(fp16_file)
+        assert [i.type for i in session.get_inputs()] == [
+            "tensor(float)",
+            "tensor(int64)",
+            "tensor(float)",
+        ]
+        y, y_int, resized = (np.asarray(o) for o in session.run(None, feeds))
+        assert y.dtype == np.float32 and resized.dtype == np.float32
+        np.testing.assert_allclose(y, np.asarray(expected[0]), rtol=1e-3)
+        np.testing.assert_array_equal(y_int, np.asarray(expected[1]))
+        np.testing.assert_allclose(resized, np.asarray(expected[2]), rtol=1e-3)
+
+        converted = onnx.load(fp16_file)
+        types = {i.name: i.data_type for i in converted.graph.initializer}
+        assert types == {"w": TensorProto.FLOAT16, "scales": TensorProto.FLOAT}
+        (constant,) = [n for n in converted.graph.node if n.name == "constant"]
+        value = numpy_helper.to_array(constant.attribute[0].t)
+        # 1e9 is beyond float16, and stays finite.
+        assert value.dtype == np.float16 and np.isfinite(value).all()
+
+
+def test_convert_float16_keeps_counts_float32() -> None:
+    # The mask stability score of SAM3's point decoder: the ratio of two pixel
+    # counts, which pass 65504, the largest float16, on a 288x288 mask.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = pathlib.Path(tmp_dir)
+
+        def count(name: str, threshold: str) -> list[onnx.NodeProto]:
+            return [
+                helper.make_node("Greater", ["mask", threshold], [f"{name}_bool"]),
+                helper.make_node(
+                    "Cast", [f"{name}_bool"], [f"{name}_int"], to=TensorProto.INT64
+                ),
+                helper.make_node(
+                    "ReduceSum", [f"{name}_int"], [f"{name}_sum"], keepdims=0
+                ),
+                helper.make_node("Cast", [f"{name}_sum"], [name], to=TensorProto.FLOAT),
+            ]
+
+        graph = helper.make_graph(
+            [
+                *count("intersection", "high"),
+                *count("union", "low"),
+                helper.make_node("Div", ["intersection", "union"], ["ratio"]),
+                helper.make_node("Greater", ["ratio", "stable"], ["is_stable"]),
+            ],
+            "test",
+            [helper.make_tensor_value_info("mask", TensorProto.FLOAT, [288, 288])],
+            [
+                helper.make_tensor_value_info("ratio", TensorProto.FLOAT, []),
+                helper.make_tensor_value_info("is_stable", TensorProto.BOOL, []),
+            ],
+            [
+                numpy_helper.from_array(np.array(0.05, np.float32), "high"),
+                numpy_helper.from_array(np.array(-0.05, np.float32), "low"),
+                numpy_helper.from_array(np.array(0.8, np.float32), "stable"),
+            ],
+        )
+        model = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 21)], ir_version=10
+        )
+        onnx_file = tmp_path / "model.onnx"
+        fp16_file = tmp_path / "model_fp16.onnx"
+        onnx.save(model, onnx_file)
+        convert_float16(onnx_file, fp16_file)
+
+        # 70000 pixels above 0.05 and 82944 above -0.05.
+        mask = np.zeros(288 * 288, np.float32)
+        mask[:70000] = 1
+        # onnxruntime on CPU computes float16 nodes in float32, which hides an
+        # overflow, so run the reference implementation.
+        ratio, is_stable = ReferenceEvaluator(str(fp16_file)).run(
+            None, {"mask": mask.reshape(288, 288)}
+        )
+        np.testing.assert_allclose(np.asarray(ratio), 70000 / 82944, rtol=1e-3)
+        assert is_stable
+
+
 if __name__ == "__main__":
     test_postprocess()
+    test_convert_float16()
+    test_convert_float16_keeps_counts_float32()
     print("ok")
