@@ -11,6 +11,7 @@ from onnx.reference import ReferenceEvaluator
 
 from infer_onnx import load_for_coreml
 from postprocess_onnx import convert_float16
+from postprocess_onnx import convert_int8
 from postprocess_onnx import postprocess
 
 
@@ -284,8 +285,53 @@ def test_convert_float16_keeps_counts_float32() -> None:
         assert is_stable
 
 
+def test_convert_int8() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = pathlib.Path(tmp_dir)
+        rng = np.random.default_rng(0)
+        # A linear layer as postprocess leaves it, Gemm(transB=1) with a bias,
+        # then a MatMul of two activations, as in attention.
+        graph = helper.make_graph(
+            [
+                helper.make_node("Gemm", ["x", "w", "b"], ["h"], transB=1),
+                helper.make_node("Transpose", ["h"], ["h_t"]),
+                helper.make_node("MatMul", ["h", "h_t"], ["y"]),
+            ],
+            "test",
+            [helper.make_tensor_value_info("x", TensorProto.FLOAT, [8, 64])],
+            [helper.make_tensor_value_info("y", TensorProto.FLOAT, [8, 8])],
+            [
+                numpy_helper.from_array(
+                    rng.standard_normal((32, 64), dtype=np.float32), "w"
+                ),
+                numpy_helper.from_array(rng.standard_normal(32, dtype=np.float32), "b"),
+            ],
+        )
+        model = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 21)], ir_version=10
+        )
+        onnx_file = tmp_path / "model.onnx"
+        int8_file = tmp_path / "model_int8.onnx"
+        onnx.save(model, onnx_file)
+        feeds = {"x": rng.standard_normal((8, 64), dtype=np.float32)}
+        (expected,) = onnxruntime.InferenceSession(onnx_file).run(None, feeds)
+
+        convert_int8(onnx_file, int8_file)
+
+        (y,) = onnxruntime.InferenceSession(int8_file).run(None, feeds)
+        y = np.asarray(y)
+        assert y.dtype == np.float32
+        expected = np.asarray(expected)
+        assert np.linalg.norm(y - expected) < 0.01 * np.linalg.norm(expected)
+        ops = [n.op_type for n in onnx.load(int8_file).graph.node]
+        # The weight's MatMul is int8, the activations' stays float32.
+        assert "Gemm" not in ops
+        assert ops.count("MatMulInteger") == 1 and ops.count("MatMul") == 1
+
+
 if __name__ == "__main__":
     test_postprocess()
     test_convert_float16()
     test_convert_float16_keeps_counts_float32()
+    test_convert_int8()
     print("ok")

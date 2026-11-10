@@ -9,6 +9,8 @@ from loguru import logger
 from onnx import TensorProto
 from onnx import helper
 from onnx import numpy_helper
+from onnxruntime.quantization import QuantType
+from onnxruntime.quantization import quantize_dynamic
 
 
 def postprocess(onnx_file: pathlib.Path) -> None:
@@ -334,6 +336,62 @@ def convert_float16(onnx_file: pathlib.Path, output_file: pathlib.Path) -> None:
     logger.debug("converted to float16: {!r}", str(output_file))
 
 
+def convert_int8(onnx_file: pathlib.Path, output_file: pathlib.Path) -> None:
+    """Write a copy of the model whose linear layers compute in int8, for CPUs.
+
+    Their weights become int8, and onnxruntime quantizes their inputs as it
+    runs (dynamic quantization). Other ops stay float32, and so do the inputs
+    and outputs.
+    """
+    model: onnx.ModelProto = onnx.load(onnx_file)
+    graph: onnx.GraphProto = model.graph
+    initializers: dict[str, onnx.TensorProto] = {t.name: t for t in graph.initializer}
+    # Gemm -> MatMul + Add, as dynamic quantization takes MatMul and not Gemm,
+    # which the linear layers are after postprocess.
+    nodes: list[onnx.NodeProto] = []
+    for node in graph.node:
+        attributes = {a.name: helper.get_attribute_value(a) for a in node.attribute}
+        weight = initializers.get(node.input[1]) if node.op_type == "Gemm" else None
+        if (
+            weight is None
+            or attributes.get("transA", 0)
+            or attributes.get("alpha", 1.0) != 1.0
+            or attributes.get("beta", 1.0) != 1.0
+        ):
+            nodes.append(node)
+            continue
+        (x, weight_name, *rest) = node.input
+        if attributes.get("transB", 0):
+            weight_name = f"{weight.name}_transposed"
+            if weight_name not in initializers:
+                transposed = numpy_helper.to_array(weight).T
+                initializers[weight_name] = numpy_helper.from_array(
+                    transposed, weight_name
+                )
+                graph.initializer.append(initializers[weight_name])
+        (output,) = node.output
+        bias: str = rest[0] if rest else ""
+        matmul = f"{output}_matmul" if bias else output
+        nodes.append(
+            helper.make_node("MatMul", [x, weight_name], [matmul], name=matmul)
+        )
+        if bias:
+            nodes.append(helper.make_node("Add", [matmul, bias], [output], name=output))
+    del graph.node[:]
+    graph.node.extend(nodes)
+    # Drop the {N, K} weights that only the Gemms read.
+    used: set[str] = {name for n in _all_nodes(graph) for name in n.input}
+    for index in reversed(range(len(graph.initializer))):
+        if graph.initializer[index].name not in used:
+            del graph.initializer[index]
+    # Only the MatMuls with a weight: attention's MatMuls of two activations
+    # stay float32.
+    quantize_dynamic(
+        model, output_file, op_types_to_quantize=["MatMul"], weight_type=QuantType.QInt8
+    )
+    logger.debug("converted to int8: {!r}", str(output_file))
+
+
 def _static_shapes(model: onnx.ModelProto) -> dict[str, list[int]]:
     graph: onnx.GraphProto = onnx.shape_inference.infer_shapes(
         model, data_prop=True
@@ -357,20 +415,28 @@ def _all_nodes(graph: onnx.GraphProto):
 def main() -> None:
     parser = argparse.ArgumentParser(description=postprocess.__doc__)
     parser.add_argument("onnx_files", type=pathlib.Path, nargs="+")
-    parser.add_argument(
+    copy = parser.add_mutually_exclusive_group()
+    copy.add_argument(
         "--fp16",
         action="store_true",
         help="Instead, write a float16 copy for GPUs next to each file, "
         "as <name>_fp16.onnx.",
     )
+    copy.add_argument(
+        "--int8",
+        action="store_true",
+        help="Instead, write an int8 copy for CPUs next to each file, "
+        "as <name>_int8.onnx.",
+    )
     args = parser.parse_args()
     for onnx_file in args.onnx_files:
-        if not args.fp16:
+        if not (args.fp16 or args.int8):
             postprocess(onnx_file)
-        elif not onnx_file.stem.endswith("_fp16"):
-            convert_float16(
-                onnx_file, onnx_file.with_name(f"{onnx_file.stem}_fp16.onnx")
+        elif not onnx_file.stem.endswith(("_fp16", "_int8")):
+            (suffix, convert) = (
+                ("_fp16", convert_float16) if args.fp16 else ("_int8", convert_int8)
             )
+            convert(onnx_file, onnx_file.with_name(f"{onnx_file.stem}{suffix}.onnx"))
 
 
 if __name__ == "__main__":

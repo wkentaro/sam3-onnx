@@ -56,6 +56,9 @@ uv run postprocess_onnx.py models/*.onnx && rm models/*.onnx.data
 # write float16 copies for GPUs, as models/*_fp16.onnx
 uv run postprocess_onnx.py --fp16 models/*.onnx
 
+# write an int8 image encoder for CPUs, as models/sam3_image_encoder_int8.onnx
+uv run postprocess_onnx.py --int8 models/sam3_image_encoder.onnx
+
 # upload to Hugging Face Hub
 # uvx hf upload wkentaro/sam3-onnx-models-v0.6.0 models/ --include '*.onnx'
 ```
@@ -109,6 +112,8 @@ uv run infer_onnx.py --image images/bus.jpg --text-prompt person --box-prompt 0.
 uv run infer_onnx.py --image images/bus.jpg --point-prompt 0.18,0.55
 uv run infer_onnx.py --image images/bus.jpg --point-prompt 0.18,0.55 --point-prompt 0.2,0.7 --single-mask  # one mask, for several points
 ```
+
+Add `--int8` to run the int8 image encoder, which `uv run postprocess_onnx.py --int8 models/sam3_image_encoder.onnx` writes. Its linear layers compute in int8. On an i9-12900K it encodes an image in 4.3 s against 7.5 s, and on an M5 CPU in 6.1 s against 7.1 s. It gives the same text detections, with scores within 0.007, and its tracked masks have a mean IoU of 0.994 with float32's, as PyTorch has 0.993 between bfloat16 and float32. The other models stay float32: with int8 tracker models, one of two tracked objects was lost, and int8 decoders ran no faster. `--int8` works with `--device cpu` and also in `infer_video_onnx.py` and `benchmark.py`.
 
 **Video tracking with onnx**
 
