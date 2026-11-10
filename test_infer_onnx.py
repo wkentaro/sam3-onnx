@@ -71,6 +71,8 @@ def test_model_device() -> None:
         assert model_device("image_encoder", "coreml", has_webgpu) == "coreml"
     assert model_device("memory_attention", "coreml", has_webgpu=True) == "webgpu"
     assert model_device("memory_attention", "coreml", has_webgpu=False) == "cpu"
+    # The fixed-shape memory attention exists for CoreML.
+    assert model_device("memory_attention_fixed", "coreml", True) == "coreml"
 
 
 def test_parse_box_prompt() -> None:

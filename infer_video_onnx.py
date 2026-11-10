@@ -17,6 +17,7 @@ from infer_onnx import DEVICES
 from infer_onnx import FP16_HELP
 from infer_onnx import INT8_HELP
 from infer_onnx import create_sessions
+from infer_onnx import optional_names
 from track_onnx import MODEL_NAMES
 from track_onnx import Tracker
 from track_onnx import encode_frame
@@ -102,7 +103,7 @@ def main() -> None:
     args = parse_args()
 
     model_names = MODEL_NAMES if args.text_prompt is None else video_onnx.MODEL_NAMES
-    names = ["image_encoder", *model_names]
+    names = ["image_encoder", *model_names, *optional_names(args.device, args.fp16)]
     sessions = dict(
         zip(
             names,

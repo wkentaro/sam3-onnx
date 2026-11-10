@@ -304,13 +304,13 @@ INT8_HELP = (
 def model_device(name: str, device: str, has_webgpu: bool) -> str:
     """The device that runs one model.
 
-    With coreml, CoreML runs the image encoder alone: it runs it 3 times as
-    fast as WebGPU does on an Apple GPU, but it can't compile the tracker's
-    memory attention, whose input grows as frames fill the memory, and the
-    decoders take longer to compile than it saves them. WebGPU runs those
-    when its plugin is installed, and the CPU otherwise.
+    With coreml, CoreML runs the image encoder and the fixed-shape memory
+    attention, 2 to 3 times as fast as WebGPU does on an Apple GPU. It can't
+    compile an input whose shape changes, as the other tracker models have,
+    and the decoder takes it 11 s to compile for 140 ms less per run. WebGPU
+    runs those when its plugin is installed, and the CPU otherwise.
     """
-    if device != "coreml" or name == "image_encoder":
+    if device != "coreml" or name in ("image_encoder", "memory_attention_fixed"):
         return device
     return "webgpu" if has_webgpu else "cpu"
 
@@ -327,6 +327,15 @@ def model_file(name: str, device: str, fp16: bool, int8: bool = False) -> str:
     if int8 and device == "cpu" and name == "image_encoder":
         return f"models/sam3_{name}_int8.onnx"
     return f"models/sam3_{name}.onnx"
+
+
+def optional_names(device: str, fp16: bool) -> list[str]:
+    """The models a device runs on top of the tracker's when their files
+    exist, which an export before them lacks."""
+    name = "memory_attention_fixed"
+    if device == "coreml" and pathlib.Path(model_file(name, device, fp16)).exists():
+        return [name]
+    return []
 
 
 def _has_webgpu() -> bool:

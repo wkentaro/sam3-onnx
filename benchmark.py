@@ -130,13 +130,18 @@ def run_onnx(args: argparse.Namespace, paths: list[pathlib.Path]) -> dict:
     from infer_onnx import POINT_DECODER_FEATURES
     from infer_onnx import create_sessions
     from infer_onnx import make_box_inputs
+    from infer_onnx import optional_names
     from infer_onnx import postprocess_decoder_output
     from infer_onnx import postprocess_point_decoder_output
     from infer_onnx import preprocess_image
     from infer_onnx import run_on_device
     from infer_onnx import run_point_decoder
 
-    names = ["image_encoder", *video_onnx.MODEL_NAMES]
+    names = [
+        "image_encoder",
+        *video_onnx.MODEL_NAMES,
+        *optional_names(args.device, args.fp16),
+    ]
     start = time.perf_counter()
     sessions = dict(
         zip(

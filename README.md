@@ -149,7 +149,7 @@ The `gpu` group installs `onnxruntime-gpu` with its CUDA and cuDNN libraries, so
 uv run --no-dev --group webgpu infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --text-prompt person --device coreml --fp16 --output /tmp/bedroom.mp4
 ```
 
-`--device coreml` runs the image encoder on the GPU through CoreML, 3 times as fast as WebGPU runs it. CoreML can't compile the tracker's memory attention, whose input grows as frames fill the memory, so the other models run on WebGPU when the `webgpu` group is installed, and on the CPU without it. With `--fp16` on an M5, a text prompt on an image takes 1.2 s and a tracked video frame of one object takes 1.2 s.
+`--device coreml` runs the image encoder on the GPU through CoreML, 3 times as fast as WebGPU runs it. It also runs `sam3_memory_attention_fixed.onnx`, a copy of the tracker's memory attention padded to a fixed shape, in about half the time WebGPU takes for the one whose input grows as frames fill the memory. CoreML can't compile an input whose shape changes, so the other models run on WebGPU when the `webgpu` group is installed, and on the CPU without it. With `--fp16` on an M5, a text prompt on an image takes 1.2 s and a tracked video frame of one object takes 1.2 s.
 
 **Inference with onnx on WebGPU (macOS, Linux, Windows)**
 
