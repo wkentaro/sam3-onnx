@@ -18,6 +18,8 @@ import onnxruntime
 import PIL.Image
 from numpy.typing import NDArray
 
+from infer_onnx import run_on_device
+
 # Sam3TrackerBase and build_tracker
 IMAGE_SIZE: int = 1008
 LOW_RES_MASK_SIZE: int = 288
@@ -85,14 +87,15 @@ def _resize_antialias(
 def encode_frame(
     session: onnxruntime.InferenceSession, frame: NDArray[np.uint8]
 ) -> list[NDArray]:
-    """Run the image encoder on an RGB frame (H, W, 3) for Tracker."""
+    """Run the image encoder on an RGB frame (H, W, 3) for Tracker. On CUDA
+    and WebGPU, the features stay on the GPU, as run_on_device returns them."""
     # Sam3TrackerPredictor resizes video frames with PIL's default filter.
     image = PIL.Image.fromarray(frame).resize((IMAGE_SIZE, IMAGE_SIZE))
-    outputs = session.run(
+    return run_on_device(
+        session,
         ["image_embeddings", "high_res_features1", "high_res_features2"],
         {"image": np.asarray(image).transpose(2, 0, 1)},
     )
-    return typing.cast(list[NDArray], outputs)
 
 
 def _select_closest_cond_frames(
@@ -340,6 +343,8 @@ class Tracker:
         image_embeddings = self._features(frame_idx)[0]
         if is_init_cond_frame or not use_prev_mem_frame:
             # The image encoder adds no_mem_embed already.
+            if isinstance(image_embeddings, onnxruntime.OrtValue):
+                image_embeddings = image_embeddings.numpy()
             return np.repeat(image_embeddings, batch_size, axis=0)
 
         tpos_sign_mul = -1 if track_in_reverse else 1

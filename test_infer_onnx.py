@@ -1,12 +1,15 @@
 import sys
+from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import numpy as np
+import onnxruntime
 
 from infer_onnx import main
 from infer_onnx import model_device
 from infer_onnx import model_file
 from infer_onnx import parse_args
+from infer_onnx import run_on_device
 from infer_onnx import run_point_decoder
 
 
@@ -108,10 +111,35 @@ def test_single_mask() -> None:
     assert (masks == 2).all()
 
 
+def test_run_on_device() -> None:
+    image = np.zeros((3, 4, 4), np.uint8)
+    features = onnxruntime.OrtValue.ortvalue_from_numpy(np.zeros(2, np.float32))  # type: ignore[possibly-missing-attribute]
+    session = MagicMock()
+    session.get_providers.return_value = ["CPUExecutionProvider"]
+    session.run.return_value = [np.ones(1)]
+    assert run_on_device(session, ["a"], {"image": image}) == [np.ones(1)]
+    session.io_binding.assert_not_called()
+
+    # On a GPU, the outputs stay on it, and OrtValue inputs bind as they are.
+    session = MagicMock()
+    session.get_providers.return_value = ["CUDAExecutionProvider"]
+    binding = session.io_binding.return_value
+    outputs = run_on_device(session, ["a", "b"], {"image": image, "f": features})
+    binding.bind_cpu_input.assert_called_once_with("image", image)
+    binding.bind_ortvalue_input.assert_called_once_with("f", features)
+    assert [c.args for c in binding.bind_output.call_args_list] == [
+        ("a", "cuda"),
+        ("b", "cuda"),
+    ]
+    session.run.assert_not_called()
+    assert outputs is binding.get_outputs.return_value
+
+
 if __name__ == "__main__":
     test_language_encoder_selection()
     test_model_file()
     test_model_device()
     test_parse_box_prompt()
     test_single_mask()
+    test_run_on_device()
     print("ok")

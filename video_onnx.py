@@ -26,6 +26,7 @@ from infer_onnx import DECODER_FEATURES
 from infer_onnx import POINT_DECODER_FEATURES
 from infer_onnx import make_box_inputs
 from infer_onnx import preprocess_image
+from infer_onnx import run_on_device
 from track_onnx import INPUT_MASK_SIZE
 from track_onnx import LOW_RES_MASK_SIZE
 from track_onnx import MODEL_NAMES as TRACKER_MODEL_NAMES
@@ -60,12 +61,13 @@ VideoOutput = dict[str, NDArray]
 def encode_frame(
     session: onnxruntime.InferenceSession, frame: NDArray[np.uint8]
 ) -> dict[str, NDArray]:
-    """Run the image encoder on an RGB frame (H, W, 3) for VideoInference."""
+    """Run the image encoder on an RGB frame (H, W, 3) for VideoInference. On
+    CUDA and WebGPU, the features stay on the GPU, as run_on_device returns them."""
     names = [*DECODER_FEATURES, *POINT_DECODER_FEATURES]
-    outputs = session.run(
-        names, {"image": preprocess_image(PIL.Image.fromarray(frame))}
+    outputs = run_on_device(
+        session, names, {"image": preprocess_image(PIL.Image.fromarray(frame))}
     )
-    return dict(zip(names, typing.cast(list[NDArray], outputs)))
+    return dict(zip(names, outputs))
 
 
 def _mask_iou(a: NDArray[np.bool_], b: NDArray[np.bool_]) -> NDArray[np.float32]:
