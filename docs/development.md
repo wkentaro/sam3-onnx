@@ -19,6 +19,14 @@ uv run infer_torch.py --image images/bus.jpg --point-prompt 0.18,0.55
 uv run infer_torch.py --image images/bus.jpg --point-prompt 0.18,0.55 --point-prompt 0.2,0.7 --single-mask  # one mask, for several points
 ```
 
+## Convert an older export
+
+Convert models from an older export in place, as `export_onnx.py` does:
+
+```sh
+uv run postprocess_onnx.py models/*.onnx && rm models/*.onnx.data
+```
+
 ## Upload models to Hugging Face Hub
 
 ```sh
