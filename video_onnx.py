@@ -114,20 +114,32 @@ def _fill_holes_in_mask_scores(masks: NDArray) -> NDArray:
     return masks
 
 
-def _apply_non_overlapping_constraints(pred_masks: NDArray) -> NDArray:
-    """Sam3TrackerBase._apply_non_overlapping_constraints of (N, 1, H, W)."""
-    if len(pred_masks) == 1:
-        return pred_masks
-    keep = pred_masks.argmax(0)[None] == np.arange(len(pred_masks))[:, None, None, None]
-    return np.where(keep, pred_masks, np.minimum(pred_masks, -10.0))
+def _is_argmax(scores: NDArray) -> NDArray[np.bool_]:
+    """scores.argmax(0) == i for each i along axis 0, the first of tied maxima.
+
+    numpy's argmax along the first axis takes 14 ms for 3 masks of 1008x1008,
+    and this 2 ms.
+    """
+    is_max = scores == scores.max(0)
+    seen = np.zeros_like(is_max[0])
+    for is_max_i in is_max:
+        is_max_i &= ~seen
+        seen |= is_max_i
+    return is_max
 
 
 def _suppress_object_pw_area_shrinkage(pred_masks: NDArray) -> NDArray:
-    """Sam3TrackerPredictor._suppress_object_pw_area_shrinkage of (N, 1, H, W)."""
-    non_overlapping = _apply_non_overlapping_constraints(pred_masks)
-    area_before = np.maximum((pred_masks > 0).sum((-1, -2)), 1)
-    area_after = (non_overlapping > 0).sum((-1, -2))
+    """Sam3TrackerPredictor._suppress_object_pw_area_shrinkage of (N, 1, H, W).
+
+    Its Sam3TrackerBase._apply_non_overlapping_constraints keeps a pixel's
+    score for the object that scores highest there, and lowers the others to
+    -10 at most, so the area after counts the positive pixels it keeps."""
+    positive = pred_masks > 0
+    area_before = np.maximum(positive.sum((-1, -2)), 1)
+    area_after = (positive & _is_argmax(pred_masks)).sum((-1, -2))
     keep = area_after / area_before >= 0.3
+    if keep.all():
+        return pred_masks
     return np.where(keep[..., None, None], pred_masks, np.minimum(pred_masks, -10.0))
 
 
@@ -138,8 +150,7 @@ def _apply_object_wise_non_overlapping_constraints(
     binary masks (N, H, W) with background_value=0: the highest scoring object
     claims each pixel."""
     scores = np.where(masks, obj_scores[:, None, None], 0)
-    is_max = scores.argmax(0)[None] == np.arange(len(masks))[:, None, None]
-    return masks & is_max & (scores > 0)
+    return masks & _is_argmax(scores) & (scores > 0)
 
 
 def _masks_to_boxes(masks: NDArray[np.bool_]) -> NDArray[np.float32]:
