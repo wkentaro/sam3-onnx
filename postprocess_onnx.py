@@ -397,13 +397,19 @@ def fuse_attention(onnx_file: pathlib.Path) -> None:
     """Replace each attention with onnxruntime's MultiHeadAttention, which
     runs it in one kernel.
 
-    It matches the two ways torch exports attention here, and leaves any
+    It matches the three ways torch exports attention here, and leaves any
     other attention, such as one with a mask, as it is. CoreML lacks the op.
 
     sam3.model.vitdet.Attention of the image encoder, with q, k, and v in
     (batch, heads, tokens, channels) and k^T as Reshape(Transpose(Reshape(k))):
 
         Reshape(Transpose(Reshape(MatMul(Softmax(MatMul(q * s, k^T * s)), v))))
+
+    nn.MultiheadAttention of the decoder, with q, k, and v in (tokens, batch,
+    heads * channels) and batch 1, split into heads by Reshape(Transpose(
+    Reshape(x))), and k^T by a Transpose more:
+
+        Reshape(Transpose(MatMul(Softmax(MatMul(q * s, k^T * s)), v)))
 
     sam3's RoPEAttention of the memory attention, with one head and q, k, and
     v in (batch, 1, tokens, channels), where the op also keeps the logits of
@@ -490,6 +496,39 @@ def fuse_attention(onnx_file: pathlib.Path) -> None:
             (k, v) = (p + "k", av.input[1])
             # The op gives (batch, tokens, heads * channels), as the nodes
             # before the Reshape did.
+            (output, after) = (reshape.input[0], [])
+        elif (
+            (q_path := chain(qk.input[0], ["Mul", "Reshape", "Transpose", "Reshape"]))
+            and (
+                k_path := chain(
+                    qk.input[1], ["Mul", "Transpose", "Reshape", "Transpose", "Reshape"]
+                )
+            )
+            and (
+                out_path := chain_down(
+                    softmax.output[0], ["MatMul", "Transpose", "Reshape"]
+                )
+            )
+            and (
+                v_path := chain(
+                    out_path[0].input[1], ["Reshape", "Transpose", "Reshape"]
+                )
+            )
+            and all(
+                shapes.get(x.input[0], [0, 0])[1] == 1
+                for x in (q_path[3], k_path[4], v_path[2])
+            )
+            and -1 not in shapes.get(q_path[0].input[0], [-1])
+        ):
+            (_, before, reshape) = out_path
+            (_, heads, _, channels) = shapes[q_path[0].input[0]]
+            # q, k, and v in (1, tokens, heads * channels).
+            qkv_shape = shape(p + "qkv_shape", [1, -1, heads * channels])
+            nodes = [
+                helper.make_node("Reshape", [x.input[0], qkv_shape], [p + name])
+                for name, x in zip("qkv", (q_path[3], k_path[4], v_path[2]))
+            ]
+            (k, v) = (p + "k", p + "v")
             (output, after) = (reshape.input[0], [])
         elif (
             (q_path := chain(qk.input[0], ["Mul"]))

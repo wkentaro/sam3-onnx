@@ -436,6 +436,78 @@ def test_fuse_attention_one_head() -> None:
     np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-5)
 
 
+def test_fuse_attention_sequence_first() -> None:
+    # The attention of nn.MultiheadAttention in the decoder, as torch exports
+    # it: q, k, and v in (tokens, batch 1, heads * channels), and the scale
+    # that scaled_dot_product_attention computes from the shape.
+    (heads, q_tokens, kv_tokens, channels) = (2, 3, 5, 4)
+    dim = heads * channels
+
+    def shape(name: str, dims: list[int]) -> onnx.TensorProto:
+        return numpy_helper.from_array(np.array(dims, np.int64), name)
+
+    def split(x: str, tokens: int) -> list[onnx.NodeProto]:
+        return [
+            helper.make_node("Reshape", [x, f"{x}_3d"], [f"{x}_r"]),
+            helper.make_node("Transpose", [f"{x}_r"], [f"{x}_t"], perm=[1, 0, 2]),
+            helper.make_node("Reshape", [f"{x}_t", f"{x}_4d"], [f"{x}_h"]),
+        ]
+
+    graph = helper.make_graph(
+        [
+            *split("q", q_tokens),
+            *split("k", kv_tokens),
+            *split("v", kv_tokens),
+            helper.make_node("Sqrt", ["channels"], ["channels_sqrt"]),
+            helper.make_node("Div", ["one", "channels_sqrt"], ["inverse"]),
+            helper.make_node("Cast", ["inverse"], ["inverse_f"], to=TensorProto.FLOAT),
+            helper.make_node("Sqrt", ["inverse_f"], ["s"]),
+            helper.make_node("Mul", ["q_h", "s"], ["q_s"]),
+            helper.make_node("Transpose", ["k_h"], ["k_t4"], perm=[0, 1, 3, 2]),
+            helper.make_node("Mul", ["k_t4", "s"], ["k_s"]),
+            helper.make_node("MatMul", ["q_s", "k_s"], ["logits"]),
+            helper.make_node("Softmax", ["logits"], ["weights"], axis=-1),
+            helper.make_node("MatMul", ["weights", "v_h"], ["heads"]),
+            helper.make_node("Transpose", ["heads"], ["heads_t"], perm=[2, 0, 1, 3]),
+            helper.make_node("Reshape", ["heads_t", "y_shape"], ["y"]),
+        ],
+        "test",
+        [
+            helper.make_tensor_value_info(x, TensorProto.FLOAT, [tokens, 1, dim])
+            for x, tokens in zip("qkv", (q_tokens, kv_tokens, kv_tokens))
+        ],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)],
+        [
+            numpy_helper.from_array(np.array(channels, np.float32), "channels"),
+            numpy_helper.from_array(np.array(1, np.float32), "one"),
+            *[
+                shape(f"{x}_{n}d", d)
+                for x, tokens in zip("qkv", (q_tokens, kv_tokens, kv_tokens))
+                for n, d in [
+                    (3, [tokens, heads, channels]),
+                    (4, [1, heads, tokens, channels]),
+                ]
+            ],
+            shape("y_shape", [q_tokens, dim]),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    rng = np.random.default_rng(0)
+    feeds = {
+        x: rng.normal(size=(tokens, 1, dim)).astype(np.float32)
+        for x, tokens in zip("qkv", (q_tokens, kv_tokens, kv_tokens))
+    }
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        onnx_file = pathlib.Path(tmp_dir) / "model.onnx"
+        onnx.save(model, onnx_file)
+        (expected,) = onnxruntime.InferenceSession(onnx_file).run(None, feeds)
+        fuse_attention(onnx_file)
+        ops = [n.op_type for n in onnx.load(onnx_file).graph.node]
+        (actual,) = onnxruntime.InferenceSession(onnx_file).run(None, feeds)
+    assert ops.count("MultiHeadAttention") == 1 and "Softmax" not in ops
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-5)
+
+
 if __name__ == "__main__":
     test_postprocess()
     test_convert_float16()
@@ -443,4 +515,5 @@ if __name__ == "__main__":
     test_convert_int8()
     test_fuse_attention()
     test_fuse_attention_one_head()
+    test_fuse_attention_sequence_first()
     print("ok")
