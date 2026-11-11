@@ -8,6 +8,7 @@ from track_onnx import _new_output_dict
 from track_onnx import _pad_memory_attention_inputs
 from track_onnx import _resize
 from video_onnx import VideoInference
+from video_onnx import _is_argmax
 from video_onnx import _mask_iou
 from video_onnx import _nms_masks
 
@@ -27,6 +28,12 @@ def test_nms_masks() -> None:
     masks[2, 2:] = 1
     probs = np.array([0.6, 0.9, 0.7], np.float32)
     assert _nms_masks(probs, masks, 0.1).tolist() == [1, 2]
+
+
+def test_is_argmax() -> None:
+    scores = np.random.default_rng(0).integers(0, 3, (4, 5, 6))  # many ties
+    expected = scores.argmax(0) == np.arange(4)[:, None, None]
+    assert (_is_argmax(scores) == expected).all()
 
 
 def test_propagation_history() -> None:
@@ -154,6 +161,7 @@ def test_draw() -> None:
 if __name__ == "__main__":
     test_empty_masks()
     test_nms_masks()
+    test_is_argmax()
     test_propagation_history()
     test_trim_far_old_memory()
     test_pad_memory_attention_inputs()
