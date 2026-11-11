@@ -393,10 +393,54 @@ def test_fuse_attention() -> None:
     np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-5)
 
 
+def test_fuse_attention_one_head() -> None:
+    # The attention of RoPEAttention in the memory attention, as torch exports
+    # it: one head, and q, k, and v in (batch, 1, tokens, channels), with the
+    # batch unknown as in all but its first layer.
+    (q_tokens, kv_tokens, channels) = (6, 5, 4)
+    scale = numpy_helper.from_array(np.array([channels**-0.25], np.float32), "s")
+    graph = helper.make_graph(
+        [
+            helper.make_node("Mul", ["q", "s"], ["q_s"]),
+            helper.make_node("Transpose", ["k"], ["k_t"], perm=[0, 1, 3, 2]),
+            helper.make_node("Mul", ["k_t", "s"], ["k_s"]),
+            helper.make_node("MatMul", ["q_s", "k_s"], ["logits"]),
+            helper.make_node("Softmax", ["logits"], ["weights"], axis=-1),
+            helper.make_node("MatMul", ["weights", "v"], ["out"]),
+            helper.make_node("Relu", ["out"], ["y"]),
+        ],
+        "test",
+        [
+            helper.make_tensor_value_info(
+                x, TensorProto.FLOAT, ["batch", 1, n, channels]
+            )
+            for x, n in zip("qkv", (q_tokens, kv_tokens, kv_tokens))
+        ],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)],
+        [scale],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    rng = np.random.default_rng(0)
+    feeds = {
+        x: rng.normal(size=(1, 1, n, channels)).astype(np.float32)
+        for x, n in zip("qkv", (q_tokens, kv_tokens, kv_tokens))
+    }
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        onnx_file = pathlib.Path(tmp_dir) / "model.onnx"
+        onnx.save(model, onnx_file)
+        (expected,) = onnxruntime.InferenceSession(onnx_file).run(None, feeds)
+        fuse_attention(onnx_file)
+        ops = [n.op_type for n in onnx.load(onnx_file).graph.node]
+        (actual,) = onnxruntime.InferenceSession(onnx_file).run(None, feeds)
+    assert ops.count("MultiHeadAttention") == 1 and "Softmax" not in ops
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-5)
+
+
 if __name__ == "__main__":
     test_postprocess()
     test_convert_float16()
     test_convert_float16_keeps_counts_float32()
     test_convert_int8()
     test_fuse_attention()
+    test_fuse_attention_one_head()
     print("ok")
