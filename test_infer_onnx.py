@@ -1,4 +1,7 @@
+import contextlib
+import pathlib
 import sys
+import tempfile
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -60,6 +63,20 @@ def test_model_file() -> None:
     assert model_file("decoder", "cpu", fp16=False, int8=True) == (
         "models/sam3_decoder.onnx"
     )
+    # CUDA and WebGPU run the fused image encoder when an export wrote it.
+    with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
+        encoder = "models/sam3_image_encoder_fp16.onnx"
+        assert model_file("image_encoder", "cuda", fp16=True) == encoder
+        pathlib.Path("models").mkdir()
+        pathlib.Path("models/sam3_image_encoder_fused_fp16.onnx").touch()
+        for device in ["cuda", "webgpu"]:
+            assert model_file("image_encoder", device, fp16=True) == (
+                "models/sam3_image_encoder_fused_fp16.onnx"
+            )
+        assert model_file("image_encoder", "coreml", fp16=True) == encoder
+        assert model_file("image_encoder", "cuda", fp16=False) == (
+            "models/sam3_image_encoder.onnx"
+        )
 
 
 def test_model_device() -> None:

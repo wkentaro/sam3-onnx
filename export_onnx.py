@@ -10,6 +10,7 @@ import numpy as np
 import onnx
 import onnxruntime
 import PIL.Image
+import sam3.model.vitdet  # type: ignore[unresolved-import]
 import torch
 from loguru import logger
 from numpy.typing import NDArray
@@ -25,11 +26,33 @@ from infer_onnx import postprocess_point_decoder_output
 from infer_onnx import preprocess_image
 from infer_onnx import run_point_decoder
 from infer_torch import get_replace_freqs_cis
+from postprocess_onnx import fuse_attention
 from postprocess_onnx import postprocess
 from track_onnx import FIXED_NUM_MEMORIES
 from track_onnx import FIXED_NUM_OBJ_PTRS
 
 MAX_BOXES: int = 16
+
+
+def _rope_image_encoder(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+    repeat_freqs_k: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """sam3.model.vitdet.apply_rotary_enc2 without its split into real and
+    imaginary halves, which takes onnxruntime longer than the rotation.
+
+    A channel pair (a, b) rotates to (a cos - b sin, b cos + a sin), which is
+    x * (cos, cos) + (b, a) * (-sin, sin): one Gather swaps each pair.
+    """
+    assert not repeat_freqs_k
+    cos = freqs_cos.repeat_interleave(2, dim=-1)
+    sin = torch.stack([-freqs_sin, freqs_sin], dim=-1).flatten(-2)
+    swap = torch.arange(xq.shape[-1], device=xq.device) ^ 1
+    xq, xk = (x * cos + torch.index_select(x, -1, swap) * sin for x in (xq, xk))
+    return xq, xk
 
 
 class _ImageEncoder(torch.nn.Module):
@@ -78,11 +101,15 @@ def _postprocess(onnx_file: pathlib.Path) -> None:
 
 
 def _export_image_encoder(
-    processor: Sam3Processor, image: PIL.Image.Image
+    processor: Sam3Processor, image: PIL.Image.Image, fused: bool = False
 ) -> tuple[list[NDArray], list[NDArray], list[NDArray]]:
+    """With fused, the copy that CUDA and WebGPU run: its RoPE and attention
+    take them half the time, but CoreML 6 minutes to compile."""
     pixels = preprocess_image(image)
 
-    onnx_file: pathlib.Path = pathlib.Path("models/sam3_image_encoder.onnx")
+    onnx_file = pathlib.Path(
+        f"models/sam3_image_encoder{'_fused' if fused else ''}.onnx"
+    )
     # v0.3.0 and earlier encoders lack the outputs of the point decoder.
     if onnx_file.exists() and "image_embeddings" in [
         o.name for o in onnx.load(onnx_file, load_external_data=False).graph.output
@@ -96,6 +123,9 @@ def _export_image_encoder(
         #     output = image_backbone(input_image)
 
         logger.debug("exporting onnx model: {!r}", str(onnx_file))
+        apply_rotary_enc2 = sam3.model.vitdet.apply_rotary_enc2
+        if fused:
+            sam3.model.vitdet.apply_rotary_enc2 = _rope_image_encoder
         torch.onnx.export(
             encoder,
             args=(input_image,),
@@ -115,8 +145,11 @@ def _export_image_encoder(
             opset_version=21,
             verify=True,
         )
+        sam3.model.vitdet.apply_rotary_enc2 = apply_rotary_enc2
         logger.debug("exported onnx model: {!r}", str(onnx_file))
         _postprocess(onnx_file)
+        if fused:
+            fuse_attention(onnx_file)
 
     session: onnxruntime.InferenceSession = onnxruntime.InferenceSession(onnx_file)
     output = session.run(None, {"image": pixels})
@@ -869,6 +902,11 @@ def main():
     vision_pos_enc, backbone_fpn, sam2_features = _export_image_encoder(
         processor, image
     )
+    fused_outputs = _export_image_encoder(processor, image, fused=True)
+    for output, fused_output in zip(
+        [*vision_pos_enc, *backbone_fpn, *sam2_features], sum(fused_outputs, [])
+    ):
+        np.testing.assert_allclose(fused_output, output, atol=1e-2)
     # }}
 
     # language_encoder {{

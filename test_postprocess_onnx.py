@@ -12,6 +12,7 @@ from onnx.reference import ReferenceEvaluator
 from infer_onnx import load_for_coreml
 from postprocess_onnx import convert_float16
 from postprocess_onnx import convert_int8
+from postprocess_onnx import fuse_attention
 from postprocess_onnx import postprocess
 
 
@@ -333,9 +334,69 @@ def test_convert_int8() -> None:
         assert ops.count("MatMulInteger") == 1 and ops.count("MatMul") == 1
 
 
+def test_fuse_attention() -> None:
+    # The attention of sam3.model.vitdet.Attention over a 2x3 window, as torch
+    # exports it: batch 2, heads 2, tokens 6, channels 4.
+    (batch, heads, h, w, channels) = (2, 2, 2, 3, 4)
+    tokens = h * w
+
+    def shape(name: str, dims: list[int]) -> onnx.TensorProto:
+        return numpy_helper.from_array(np.array(dims, np.int64), name)
+
+    scale = numpy_helper.from_array(np.array([channels**-0.25], np.float32), "s")
+    graph = helper.make_graph(
+        [
+            helper.make_node("Mul", ["q", "s"], ["q_s"]),
+            helper.make_node("Reshape", ["k", "k_3d"], ["k_r"]),
+            helper.make_node("Transpose", ["k_r"], ["k_t"], perm=[0, 2, 1]),
+            helper.make_node("Reshape", ["k_t", "k_4d"], ["k_t4"]),
+            helper.make_node("Mul", ["k_t4", "s"], ["k_s"]),
+            helper.make_node("MatMul", ["q_s", "k_s"], ["logits"]),
+            helper.make_node("Softmax", ["logits"], ["weights"], axis=-1),
+            helper.make_node("MatMul", ["weights", "v"], ["heads"]),
+            helper.make_node("Reshape", ["heads", "heads_5d"], ["heads_r"]),
+            helper.make_node(
+                "Transpose", ["heads_r"], ["heads_t"], perm=[0, 2, 3, 1, 4]
+            ),
+            helper.make_node("Reshape", ["heads_t", "y_shape"], ["y"]),
+        ],
+        "test",
+        [
+            helper.make_tensor_value_info(
+                x, TensorProto.FLOAT, [batch, heads, tokens, channels]
+            )
+            for x in "qkv"
+        ],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)],
+        [
+            scale,
+            shape("k_3d", [batch * heads, tokens, channels]),
+            shape("k_4d", [batch, heads, channels, tokens]),
+            shape("heads_5d", [batch, heads, h, w, channels]),
+            shape("y_shape", [batch, h, w, heads * channels]),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    rng = np.random.default_rng(0)
+    feeds = {
+        x: rng.normal(size=(batch, heads, tokens, channels)).astype(np.float32)
+        for x in "qkv"
+    }
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        onnx_file = pathlib.Path(tmp_dir) / "model.onnx"
+        onnx.save(model, onnx_file)
+        (expected,) = onnxruntime.InferenceSession(onnx_file).run(None, feeds)
+        fuse_attention(onnx_file)
+        ops = [n.op_type for n in onnx.load(onnx_file).graph.node]
+        (actual,) = onnxruntime.InferenceSession(onnx_file).run(None, feeds)
+    assert ops.count("MultiHeadAttention") == 1 and "Softmax" not in ops
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-5)
+
+
 if __name__ == "__main__":
     test_postprocess()
     test_convert_float16()
     test_convert_float16_keeps_counts_float32()
     test_convert_int8()
+    test_fuse_attention()
     print("ok")
