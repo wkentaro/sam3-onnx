@@ -95,7 +95,7 @@ The `gpu` group installs `onnxruntime-gpu` with its CUDA and cuDNN libraries, so
 uv run --no-dev --group webgpu infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --text-prompt person --device coreml --fp16 --output /tmp/bedroom.mp4
 ```
 
-`--device coreml` runs the image encoder through CoreML and the other models on WebGPU. See [docs/performance.md](docs/performance.md#coreml).
+`--device coreml` runs the image encoder and fixed-shape memory attention through CoreML, and the other models on WebGPU, or the CPU without it. See [docs/performance.md](docs/performance.md#coreml).
 
 **Inference with onnx on WebGPU (macOS, Linux, Windows)**
 
