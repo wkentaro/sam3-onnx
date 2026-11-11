@@ -432,8 +432,15 @@ def test_fuse_attention_one_head() -> None:
         fuse_attention(onnx_file)
         ops = [n.op_type for n in onnx.load(onnx_file).graph.node]
         (actual,) = onnxruntime.InferenceSession(onnx_file).run(None, feeds)
+        # The float16 copy takes the queries in halves.
+        fp16_file = pathlib.Path(tmp_dir) / "model_fp16.onnx"
+        convert_float16(onnx_file, fp16_file)
+        fp16_ops = [n.op_type for n in onnx.load(fp16_file).graph.node]
+        (fp16_actual,) = onnxruntime.InferenceSession(fp16_file).run(None, feeds)
     assert ops.count("MultiHeadAttention") == 1 and "Softmax" not in ops
     np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-5)
+    assert fp16_ops.count("MultiHeadAttention") == 2
+    np.testing.assert_allclose(np.asarray(fp16_actual), np.asarray(expected), atol=1e-2)
 
 
 def test_fuse_attention_sequence_first() -> None:
