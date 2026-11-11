@@ -7,7 +7,7 @@
 ```sh
 git clone https://github.com/wkentaro/sam3-onnx.git --recursive && cd sam3-onnx
 
-uvx hf download wkentaro/sam3-onnx-models-v0.6.0 --local-dir models  # download pre-exported models
+uvx hf download wkentaro/sam3-onnx-models-v0.7.0 --local-dir models  # download pre-exported models
 
 uv run --no-dev infer_onnx.py --image images/bus.jpg --text-prompt person
 uv run --no-dev infer_onnx.py --image images/sofa.jpg --text-prompt sofa
@@ -15,8 +15,6 @@ uv run --no-dev infer_onnx.py --image images/dog.jpg --box-prompt  # opens a gui
 ```
 
 <img src="assets/example_bus_person.jpg" width="25%" /> <img src="assets/example_sofa_sofa.jpg" width="30%" /> <img src="assets/example_dog_face_boxprompt.jpg" width="36%" />
-
-The v0.6.0 models predate video tracking and the faster models below. To get them, [export](#export) the models yourself.
 
 ## Examples
 
