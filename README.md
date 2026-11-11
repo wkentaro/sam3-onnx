@@ -145,6 +145,8 @@ On `--device cuda` and `webgpu`, the image encoder runs from `sam3_image_encoder
 
 On `--device cuda`, the memory attention runs from `sam3_memory_attention_fused.onnx`, whose attention is onnxruntime's `MultiHeadAttention` as well. The logits of its cross-attention grow with each frame, and onnxruntime's CUDA arena, which the sessions share, keeps a new region for them on every frame. Tracking a video with `sam3_memory_attention.onnx` alone runs out of memory on a 12 GB GPU, and with the fused copy it peaks at 6.5 GB. It costs 6 ms per frame for 3 objects, and runs 3 to 6 times as slow on the CPU and WebGPU, which keep the plain file.
 
+The decoder's attention runs as `MultiHeadAttention` on every device, as CoreML never runs the decoder. With `--fp16` on CUDA it decodes in 22 ms against 34 ms, and on the CPU in 1088 ms against 1303 ms.
+
 The `gpu` group installs `onnxruntime-gpu` with its CUDA and cuDNN libraries, so no system CUDA install is needed. Keep it in its own environment without the dev group: onnxruntime and onnxruntime-gpu overwrite each other's files, and so do the cuDNN libraries of torch and onnxruntime-gpu.
 
 **Inference with onnx on Apple GPU (macOS)**
