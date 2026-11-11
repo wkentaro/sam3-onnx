@@ -30,7 +30,7 @@ uv run postprocess_onnx.py models/*.onnx && rm models/*.onnx.data
 ## Upload models to Hugging Face Hub
 
 ```sh
-uvx hf upload wkentaro/sam3-onnx-models-v0.6.0 models/ --include '*.onnx'
+uvx hf upload wkentaro/sam3-onnx-models-v0.7.0 models/ --include '*.onnx'
 ```
 
 ## Check text-prompt scores against PyTorch on CPU
