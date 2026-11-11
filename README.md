@@ -25,25 +25,6 @@ uv sync  # dev mode for exporting onnx unlike --no-dev
 
 ## Usage
 
-**Inference with pytorch**
-
-```sh
-# with text prompt
-uv run infer_torch.py --image images/bus.jpg --text-prompt person
-
-# with box prompt
-uv run infer_torch.py --image images/bus.jpg --box-prompt 0.548,0.658,0.043,0.095
-uv run infer_torch.py --image images/bus.jpg --box-prompt  # opens a gui to select box
-
-# with several example boxes: cx,cy,w,h[,label] (label 0 for a negative example), also with text
-uv run infer_torch.py --image images/bus.jpg --box-prompt 0.184,0.601,0.24,0.466 --box-prompt 0.35,0.585,0.146,0.419,0
-uv run infer_torch.py --image images/bus.jpg --text-prompt person --box-prompt 0.35,0.585,0.146,0.419,0
-
-# with point prompt: x,y[,label] (normalized, label 0 for background), repeatable
-uv run infer_torch.py --image images/bus.jpg --point-prompt 0.18,0.55
-uv run infer_torch.py --image images/bus.jpg --point-prompt 0.18,0.55 --point-prompt 0.2,0.7 --single-mask  # one mask, for several points
-```
-
 **Export to onnx**
 
 ```sh
@@ -59,8 +40,6 @@ uv run postprocess_onnx.py --fp16 models/*.onnx
 # write an int8 image encoder for CPUs, as models/sam3_image_encoder_int8.onnx
 uv run postprocess_onnx.py --int8 models/sam3_image_encoder.onnx
 
-# upload to Hugging Face Hub
-# uvx hf upload wkentaro/sam3-onnx-models-v0.6.0 models/ --include '*.onnx'
 ```
 
 **SAM3-LiteText**
@@ -98,10 +77,6 @@ uv run infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --point-prompt
 uv run infer_video_onnx.py --video sam3/assets/videos/bedroom.mp4 --box-prompt 0.417,0.37,0.208,0.741 --output /tmp/bedroom.mp4
 ```
 
-`video_onnx.VideoInference` ports SAM3's video predictor (`Sam3VideoInferenceWithInstanceInteractivity`). A text prompt finds the objects on every frame with `sam3_decoder.onnx`, and a `Tracker` tracks each one. Points then refine an object or add one, and `remove_object` drops one.
-
-`track_onnx.Tracker` ports SAM3's video tracker (`Sam3TrackerPredictor`) to numpy on top of four models: `sam3_point_decoder.onnx`, `sam3_memory_encoder.onnx`, `sam3_memory_attention.onnx`, and `sam3_mask_downsampler.onnx`. It takes point, box, and mask prompts for several objects, refinement clicks on any frame, forward and reverse propagation, and object removal, with the same method names as the PyTorch predictor.
-
 The v0.6.0 models predate video tracking. Create the tracker models and the updated decoders and memory encoder with `uv run export_onnx.py`.
 
 **Inference with onnx on GPU**
@@ -137,27 +112,6 @@ uv run --no-dev --group webgpu infer_video_onnx.py --video sam3/assets/videos/be
 ```
 
 The `webgpu` group installs osam's WebGPU plugin, `onnxruntime-ep-webgpu`, which runs every model on the GPU through Vulkan, Direct3D 12, or Metal. On macOS, prefer `--device coreml` above.
-
-**Check text-prompt scores against PyTorch on CPU**
-
-Save the apple image from [issue #2](https://github.com/wkentaro/sam3-onnx/issues/2), then run:
-
-```sh
-uv run test_text_parity.py --apple-image /path/to/apple.jpg
-```
-
-The check compares preprocessing, image and language features, and decoder scores for apples and `images/bus.jpg` with "person". It also feeds PyTorch features to the ONNX decoder to isolate decoder errors. Both pipelines must return the same detection count and sorted scores within 0.01. PIL bilinear resizing can differ from PyTorch's tensor resize by one uint8 level. This inference fix works with the existing models; no re-export or Hugging Face upload is needed.
-
-**Check video tracking against PyTorch on CUDA**
-
-```sh
-uv run test_video_parity.py
-uv run test_video_inference_parity.py
-```
-
-The check runs point, refinement, reverse, box, mask, two-object, and removal cases on the first 60 frames of `bedroom.mp4` with the PyTorch tracker in float32, and fails if a frame's mask IoU drops below 0.99.
-
-`test_video_inference_parity.py` checks `VideoInference` the same way against `build_sam3_video_model()`. It runs text and box prompts, forward and reverse, point refinement, an added object, and removal. It fails if the object ids differ, a mask IoU drops below 0.99, or a score differs by more than 0.01.
 
 **Compare speed with PyTorch**
 
@@ -204,3 +158,7 @@ uv run infer_onnx.py --image images/dog.jpg --box-prompt 0.561,0.342,0.167,0.217
 ```
 
 <img src="assets/example_dog_dog.jpg" width="30%" /> <img src="assets/example_dog_ground.jpg" width="30%" /> <img src="assets/example_dog_face_boxprompt.jpg" width="30%" />
+
+## Development
+
+See [docs/development.md](docs/development.md) for PyTorch inference, the parity checks against PyTorch, and uploading models, and [docs/video-api.md](docs/video-api.md) for the Python API of video tracking.
