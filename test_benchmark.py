@@ -1,9 +1,11 @@
 import collections
 import time
+import types
 
 from benchmark import Timings
 from benchmark import _measure
 from benchmark import _measure_warm
+from benchmark import _run_with_iobinding
 from benchmark import _timed
 
 
@@ -66,9 +68,28 @@ def test_measure_warm_times_a_fresh_second_run() -> None:
     assert 10 <= report["model"] < 20
 
 
+def test_run_with_iobinding_reads_smallest_output_on_webgpu() -> None:
+    read: list[tuple[int, ...]] = []
+
+    def output(*shape: int):
+        return types.SimpleNamespace(
+            shape=lambda: list(shape), numpy=lambda: read.append(shape)
+        )
+
+    binding = types.SimpleNamespace(get_outputs=lambda: [output(1, 256), output(1, 4)])
+    for provider, expected in [("WebGpuExecutionProvider", [(1, 4)]), ("x", [])]:
+        read.clear()
+        session = types.SimpleNamespace(
+            get_providers=lambda: [provider], run_with_iobinding=lambda b: None
+        )
+        _run_with_iobinding(session)(binding)
+        assert read == expected
+
+
 if __name__ == "__main__":
     test_measure_buffered_frames()
     test_measure_includes_preparation()
     test_measure_warm_times_a_fresh_second_run()
     test_timed_excludes_nested_calls()
+    test_run_with_iobinding_reads_smallest_output_on_webgpu()
     print("ok")

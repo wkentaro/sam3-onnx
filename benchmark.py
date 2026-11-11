@@ -121,6 +121,24 @@ def _extract_frames(video: pathlib.Path, num_frames: int) -> list[pathlib.Path]:
     return sorted(out_dir.glob("*.jpg"))
 
 
+def _run_with_iobinding(session: typing.Any) -> typing.Callable:
+    """session.run_with_iobinding, which on WebGPU also waits for the GPU.
+
+    WebGPU returns before its GPU finishes, which would bill the time to the
+    next model that reads the outputs. Reading the smallest output waits for
+    it, for 5 ms more, which synchronize_outputs doesn't.
+    """
+    run = session.run_with_iobinding
+    if session.get_providers()[0] != "WebGpuExecutionProvider":
+        return run
+
+    def run_and_wait(binding: typing.Any) -> None:
+        run(binding)
+        min(binding.get_outputs(), key=lambda o: np.prod(o.shape())).numpy()
+
+    return run_and_wait
+
+
 def run_onnx(args: argparse.Namespace, paths: list[pathlib.Path]) -> dict:
     from osam._models.yoloworld.clip import tokenize
 
@@ -157,7 +175,7 @@ def run_onnx(args: argparse.Namespace, paths: list[pathlib.Path]) -> dict:
         session.run = _timed(timings, name, session.run, lambda: None)  # type: ignore[method-assign]
         # run_on_device runs CUDA and WebGPU sessions with this instead.
         session.run_with_iobinding = _timed(  # type: ignore[method-assign]
-            timings, name, session.run_with_iobinding, lambda: None
+            timings, name, _run_with_iobinding(session), lambda: None
         )
 
     def measure(make_steps: typing.Callable[[], typing.Iterable]) -> dict[str, float]:
