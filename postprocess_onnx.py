@@ -393,6 +393,116 @@ def convert_int8(onnx_file: pathlib.Path, output_file: pathlib.Path) -> None:
     logger.debug("converted to int8: {!r}", str(output_file))
 
 
+def fuse_attention(onnx_file: pathlib.Path) -> None:
+    """Replace each attention of the image encoder with onnxruntime's
+    MultiHeadAttention, which runs it in one kernel on CUDA and WebGPU.
+
+    It matches what torch exports for the windowed and global attention of
+    sam3.model.vitdet.Attention, with q, k, and v in (batch, heads, tokens,
+    channels) and k^T as Reshape(Transpose(Reshape(k))):
+
+        Reshape(Transpose(Reshape(MatMul(Softmax(MatMul(q * s, k^T * s)), v))))
+
+    and leaves any other attention as it is. CoreML lacks the op.
+    """
+    model: onnx.ModelProto = onnx.load(onnx_file)
+    graph: onnx.GraphProto = model.graph
+    shapes: dict[str, list[int]] = _static_shapes(model)
+    producer = {o: n for n in graph.node for o in n.output}
+    consumers: dict[str, list[onnx.NodeProto]] = {}
+    for node in graph.node:
+        for name in node.input:
+            consumers.setdefault(name, []).append(node)
+
+    def scale(mul: onnx.NodeProto) -> float:
+        (tensor,) = [t for t in graph.initializer if t.name == mul.input[1]]
+        return float(numpy_helper.to_array(tensor).item())
+
+    def chain(name: str, op_types: list[str]) -> list[onnx.NodeProto] | None:
+        """The nodes that produce name, back through op_types."""
+        nodes = []
+        for op_type in op_types:
+            node = producer.get(name)
+            if node is None or node.op_type != op_type:
+                return None
+            nodes.append(node)
+            name = node.input[0]
+        return nodes
+
+    def chain_down(name: str, op_types: list[str]) -> list[onnx.NodeProto] | None:
+        """The nodes that alone read name, on through op_types."""
+        nodes = []
+        for op_type in op_types:
+            (node, *others) = consumers.get(name, [None])
+            if node is None or others or node.op_type != op_type:
+                return None
+            nodes.append(node)
+            name = node.output[0]
+        return nodes
+
+    replacements: dict[int, list[onnx.NodeProto]] = {}
+    for i, softmax in enumerate(n for n in graph.node if n.op_type == "Softmax"):
+        (qk,) = chain(softmax.input[0], ["MatMul"]) or [None]
+        if qk is None:
+            continue
+        q_mul = chain(qk.input[0], ["Mul"])
+        k_path = chain(qk.input[1], ["Mul", "Reshape", "Transpose", "Reshape"])
+        out_path = chain_down(
+            softmax.output[0], ["MatMul", "Reshape", "Transpose", "Reshape"]
+        )
+        if q_mul is None or k_path is None or out_path is None:
+            continue
+        (av, heads_out, _, reshape) = out_path
+        (batch, heads, tokens, channels) = shapes[q_mul[0].input[0]]
+        p = f"attention{i}_"
+        # q and k in (batch, tokens, heads * channels), v in (batch, heads,
+        # tokens, channels), which the op takes as it is.
+        q_shape = numpy_helper.from_array(
+            np.array([batch, tokens, heads * channels], np.int64), p + "q_shape"
+        )
+        k_shape = numpy_helper.from_array(
+            np.array([batch, heads, tokens, channels], np.int64), p + "k_shape"
+        )
+        graph.initializer.extend([q_shape, k_shape])
+        replacements[id(heads_out)] = [
+            helper.make_node(
+                "Transpose", [q_mul[0].input[0]], [p + "q_t"], perm=[0, 2, 1, 3]
+            ),
+            helper.make_node("Reshape", [p + "q_t", q_shape.name], [p + "q"]),
+            helper.make_node("Reshape", [k_path[3].input[0], k_shape.name], [p + "k"]),
+            helper.make_node(
+                "MultiHeadAttention",
+                [p + "q", p + "k", av.input[1]],
+                [p + "out"],
+                domain="com.microsoft",
+                num_heads=heads,
+                scale=scale(q_mul[0]) * scale(k_path[0]),
+            ),
+        ]
+        # The op gives (batch, tokens, heads * channels), as the Transpose and
+        # Reshape after it did.
+        reshape.input[0] = p + "out"
+    nodes = []
+    for node in graph.node:
+        nodes.extend(replacements.get(id(node), []))
+        nodes.append(node)
+    del graph.node[:]
+    graph.node.extend(_live_nodes(nodes, {o.name for o in graph.output}))
+    model.opset_import.append(helper.make_opsetid("com.microsoft", 1))
+    onnx.save(model, onnx_file)
+    logger.debug("fused {} attentions: {!r}", len(replacements), str(onnx_file))
+
+
+def _live_nodes(nodes: list[onnx.NodeProto], outputs: set[str]) -> list[onnx.NodeProto]:
+    needed: set[str] = set(outputs)
+    live: list[onnx.NodeProto] = []
+    for node in reversed(nodes):
+        if any(o in needed for o in node.output):
+            live.append(node)
+            needed.update(node.input)
+    return live[::-1]
+
+
 def _static_shapes(model: onnx.ModelProto) -> dict[str, list[int]]:
     graph: onnx.GraphProto = onnx.shape_inference.infer_shapes(
         model, data_prop=True

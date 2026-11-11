@@ -321,12 +321,20 @@ def model_file(name: str, device: str, fp16: bool, int8: bool = False) -> str:
 
     The int8 copy for the image encoder on a CPU. The int8 tracker models lose
     objects, and the decoders run no faster.
+
+    The fused copy for the image encoder on CUDA and WebGPU, when it exists,
+    which an export before it lacks.
     """
+    suffix = ""
     if fp16 and device != "cpu":
-        return f"models/sam3_{name}_fp16.onnx"
-    if int8 and device == "cpu" and name == "image_encoder":
-        return f"models/sam3_{name}_int8.onnx"
-    return f"models/sam3_{name}.onnx"
+        suffix = "_fp16"
+    elif int8 and device == "cpu" and name == "image_encoder":
+        suffix = "_int8"
+    if name == "image_encoder" and device in ("cuda", "webgpu"):
+        fused = f"models/sam3_{name}_fused{suffix}.onnx"
+        if pathlib.Path(fused).exists():
+            return fused
+    return f"models/sam3_{name}{suffix}.onnx"
 
 
 def optional_names(device: str, fp16: bool) -> list[str]:
