@@ -211,6 +211,8 @@ def convert_float16(onnx_file: pathlib.Path, output_file: pathlib.Path) -> None:
     Its inputs and outputs stay float32, so callers run it like the original.
     It halves the file and the memory it takes, and runs up to twice as fast
     on a GPU. CPUs lack float16 kernels, so keep the original for them.
+    One-head attention also takes its queries in halves, as
+    _halve_attention_queries says.
     """
     model: onnx.ModelProto = onnx.load(onnx_file)
     graph: onnx.GraphProto = model.graph
@@ -297,7 +299,7 @@ def convert_float16(onnx_file: pathlib.Path, output_file: pathlib.Path) -> None:
                             convert(attribute.t)
         nodes.append(node)
     del graph.node[:]
-    graph.node.extend(nodes)
+    graph.node.extend(_halve_attention_queries(nodes))
 
     def rename(old: str, new: str) -> None:
         for node in graph.node:
@@ -334,6 +336,38 @@ def convert_float16(onnx_file: pathlib.Path, output_file: pathlib.Path) -> None:
     onnx.shape_inference.infer_shapes(model, check_type=True, strict_mode=True)
     onnx.save(model, output_file)
     logger.debug("converted to float16: {!r}", str(output_file))
+
+
+def _halve_attention_queries(nodes: list[onnx.NodeProto]) -> list[onnx.NodeProto]:
+    """Run each one-head MultiHeadAttention, the memory attention's, as one op
+    per half of its queries.
+
+    In float16, onnxruntime runs it on CUDA as flash attention, in a block of
+    64 queries per SM, and splits the keys between SMs only when the blocks
+    leave most SMs idle. Its 5184 queries take 81 blocks, so an RTX 3080 Ti
+    with 80 SMs runs a second pass for the last one; a half's 41 blocks have
+    their keys split. In float32, the op runs in another kernel that never
+    splits them, which halves only slow down.
+    """
+    halved: list[onnx.NodeProto] = []
+    for node in nodes:
+        heads = next((a.i for a in node.attribute if a.name == "num_heads"), None)
+        if node.op_type != "MultiHeadAttention" or heads != 1:
+            halved.append(node)
+            continue
+        (q, *kv) = node.input
+        (out,) = node.output
+        qs = [f"{q}_half{i}" for i in range(2)]
+        outs = [f"{out}_half{i}" for i in range(2)]
+        halved.append(helper.make_node("Split", [q], qs, axis=1, num_outputs=2))
+        for half_q, half_out in zip(qs, outs):
+            attention = helper.make_node(
+                "MultiHeadAttention", [half_q, *kv], [half_out], domain="com.microsoft"
+            )
+            attention.attribute.extend(node.attribute)
+            halved.append(attention)
+        halved.append(helper.make_node("Concat", outs, [out], axis=1))
+    return halved
 
 
 def convert_int8(onnx_file: pathlib.Path, output_file: pathlib.Path) -> None:
