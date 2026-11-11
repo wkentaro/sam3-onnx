@@ -16,6 +16,7 @@ import torch
 from loguru import logger
 from numpy.typing import NDArray
 from osam._models.yoloworld.clip import tokenize
+from sam3.model.position_encoding import PositionEmbeddingSine  # type: ignore[unresolved-import]
 from sam3.model.sam3_image import Sam3Image  # type: ignore[unresolved-import]
 from sam3.model.sam3_image_processor import Sam3Processor  # type: ignore[unresolved-import]
 from sam3.model.sam3_tracker_utils import get_1d_sine_pe  # type: ignore[unresolved-import]
@@ -127,6 +128,13 @@ def _export_image_encoder(
         apply_rotary_enc2 = sam3.model.vitdet.apply_rotary_enc2
         if fused:
             sam3.model.vitdet.apply_rotary_enc2 = _rope_image_encoder
+        # PositionEmbeddingSine caches the encodings it computes, which the
+        # export computes on fake tensors that the next export can't save.
+        caches = {
+            m: dict(m.cache)
+            for m in processor.model.modules()
+            if isinstance(m, PositionEmbeddingSine)
+        }
         torch.onnx.export(
             encoder,
             args=(input_image,),
@@ -147,6 +155,8 @@ def _export_image_encoder(
             verify=True,
         )
         sam3.model.vitdet.apply_rotary_enc2 = apply_rotary_enc2
+        for m, cache in caches.items():
+            m.cache = cache
         logger.debug("exported onnx model: {!r}", str(onnx_file))
         _postprocess(onnx_file)
         if fused:
