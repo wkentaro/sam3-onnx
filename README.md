@@ -47,7 +47,7 @@ uv run infer_torch.py --image images/bus.jpg --point-prompt 0.18,0.55 --point-pr
 **Export to onnx**
 
 ```sh
-# create models/*.onnx, with models/sam3_image_encoder_fused.onnx for CUDA and WebGPU
+# create models/*.onnx, with models/sam3_*_fused.onnx for CUDA and WebGPU
 uv run export_onnx.py
 
 # or convert models from an older export in place, as export_onnx.py does
@@ -142,6 +142,8 @@ Add `--fp16` to run the float16 models, which `uv run postprocess_onnx.py --fp16
 On `--device cuda` and `webgpu`, the image encoder's features stay on the GPU for the models that read them, as `infer_onnx.run_on_device` returns them. With `--fp16` on CUDA, that takes a text prompt on an image from 249 ms to 225 ms, as its 116 MB of features no longer go to the CPU and back.
 
 On `--device cuda` and `webgpu`, the image encoder runs from `sam3_image_encoder_fused.onnx` when `export_onnx.py` has written it. Its RoPE swaps each channel pair with one Gather instead of splitting and stacking them, and its attention runs as onnxruntime's `MultiHeadAttention`. With `--fp16` on an RTX 3080 Ti, it encodes an image in 151 ms against 192 ms, and a text prompt on an image takes 181 ms, against 173 ms in PyTorch. On WebGPU it encodes in 459 ms against 900 ms. CoreML takes 6 minutes to compile it, so `--device coreml` and `cpu` run `sam3_image_encoder.onnx`.
+
+On `--device cuda`, the memory attention runs from `sam3_memory_attention_fused.onnx`, whose attention is onnxruntime's `MultiHeadAttention` as well. The logits of its cross-attention grow with each frame, and onnxruntime's CUDA arena, which the sessions share, keeps a new region for them on every frame. Tracking a video with `sam3_memory_attention.onnx` alone runs out of memory on a 12 GB GPU, and with the fused copy it peaks at 6.5 GB. It costs 6 ms per frame for 3 objects, and runs 3 to 6 times as slow on the CPU and WebGPU, which keep the plain file.
 
 The `gpu` group installs `onnxruntime-gpu` with its CUDA and cuDNN libraries, so no system CUDA install is needed. Keep it in its own environment without the dev group: onnxruntime and onnxruntime-gpu overwrite each other's files, and so do the cuDNN libraries of torch and onnxruntime-gpu.
 

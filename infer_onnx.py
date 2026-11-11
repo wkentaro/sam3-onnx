@@ -315,6 +315,15 @@ def model_device(name: str, device: str, has_webgpu: bool) -> str:
     return "webgpu" if has_webgpu else "cpu"
 
 
+# The models with a fused copy, by the devices that run it faster. With its
+# one head over thousands of memories, the fused memory attention runs 3 to 6
+# times as slow on the CPU and WebGPU.
+_FUSED_DEVICES: dict[str, tuple[str, ...]] = {
+    "image_encoder": ("cuda", "webgpu"),
+    "memory_attention": ("cuda",),
+}
+
+
 def model_file(name: str, device: str, fp16: bool, int8: bool = False) -> str:
     """The float16 copy for a model that runs on a GPU, where it is faster.
     On a CPU it is slower than float32, which has more kernels.
@@ -322,15 +331,15 @@ def model_file(name: str, device: str, fp16: bool, int8: bool = False) -> str:
     The int8 copy for the image encoder on a CPU. The int8 tracker models lose
     objects, and the decoders run no faster.
 
-    The fused copy for the image encoder on CUDA and WebGPU, when it exists,
-    which an export before it lacks.
+    The fused copy for the devices in _FUSED_DEVICES, when it exists, which an
+    export before it lacks.
     """
     suffix = ""
     if fp16 and device != "cpu":
         suffix = "_fp16"
     elif int8 and device == "cpu" and name == "image_encoder":
         suffix = "_int8"
-    if name == "image_encoder" and device in ("cuda", "webgpu"):
+    if device in _FUSED_DEVICES.get(name, ()):
         fused = f"models/sam3_{name}_fused{suffix}.onnx"
         if pathlib.Path(fused).exists():
             return fused

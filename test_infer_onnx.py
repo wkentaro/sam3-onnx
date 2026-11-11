@@ -77,6 +77,14 @@ def test_model_file() -> None:
         assert model_file("image_encoder", "cuda", fp16=False) == (
             "models/sam3_image_encoder.onnx"
         )
+        # CUDA alone runs the fused memory attention.
+        pathlib.Path("models/sam3_memory_attention_fused_fp16.onnx").touch()
+        assert model_file("memory_attention", "cuda", fp16=True) == (
+            "models/sam3_memory_attention_fused_fp16.onnx"
+        )
+        assert model_file("memory_attention", "webgpu", fp16=True) == (
+            "models/sam3_memory_attention_fp16.onnx"
+        )
 
 
 def test_model_device() -> None:

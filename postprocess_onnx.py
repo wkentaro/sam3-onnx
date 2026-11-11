@@ -394,29 +394,31 @@ def convert_int8(onnx_file: pathlib.Path, output_file: pathlib.Path) -> None:
 
 
 def fuse_attention(onnx_file: pathlib.Path) -> None:
-    """Replace each attention of the image encoder with onnxruntime's
-    MultiHeadAttention, which runs it in one kernel on CUDA and WebGPU.
+    """Replace each attention with onnxruntime's MultiHeadAttention, which
+    runs it in one kernel.
 
-    It matches what torch exports for the windowed and global attention of
-    sam3.model.vitdet.Attention, with q, k, and v in (batch, heads, tokens,
-    channels) and k^T as Reshape(Transpose(Reshape(k))):
+    It matches the two ways torch exports attention here, and leaves any
+    other attention, such as one with a mask, as it is. CoreML lacks the op.
+
+    sam3.model.vitdet.Attention of the image encoder, with q, k, and v in
+    (batch, heads, tokens, channels) and k^T as Reshape(Transpose(Reshape(k))):
 
         Reshape(Transpose(Reshape(MatMul(Softmax(MatMul(q * s, k^T * s)), v))))
 
-    and leaves any other attention as it is. CoreML lacks the op.
+    sam3's RoPEAttention of the memory attention, with one head and q, k, and
+    v in (batch, 1, tokens, channels), where the op also keeps the logits of
+    the memories out of memory, which grow with each frame:
+
+        MatMul(Softmax(MatMul(q * s, Transpose(k) * s)), v)
     """
     model: onnx.ModelProto = onnx.load(onnx_file)
     graph: onnx.GraphProto = model.graph
-    shapes: dict[str, list[int]] = _static_shapes(model)
+    shapes: dict[str, list[int]] = _shapes(model)
     producer = {o: n for n in graph.node for o in n.output}
     consumers: dict[str, list[onnx.NodeProto]] = {}
     for node in graph.node:
         for name in node.input:
             consumers.setdefault(name, []).append(node)
-
-    def scale(mul: onnx.NodeProto) -> float:
-        (tensor,) = [t for t in graph.initializer if t.name == mul.input[1]]
-        return float(numpy_helper.to_array(tensor).item())
 
     def chain(name: str, op_types: list[str]) -> list[onnx.NodeProto] | None:
         """The nodes that produce name, back through op_types."""
@@ -440,48 +442,97 @@ def fuse_attention(onnx_file: pathlib.Path) -> None:
             name = node.output[0]
         return nodes
 
+    def scale(mul: onnx.NodeProto) -> float | None:
+        """s of x * s, or None for the sqrt(1 / sqrt(channels)) that
+        scaled_dot_product_attention computes from the shape, as q and k
+        together then take the op's default 1 / sqrt(channels)."""
+        if chain(mul.input[1], ["Sqrt", "Cast", "Div"]):
+            return None
+        (tensor,) = [t for t in graph.initializer if t.name == mul.input[1]]
+        return float(numpy_helper.to_array(tensor).item())
+
+    def shape(name: str, value: list[int]) -> str:
+        tensor = numpy_helper.from_array(np.array(value, np.int64), name)
+        graph.initializer.append(tensor)
+        return name
+
     replacements: dict[int, list[onnx.NodeProto]] = {}
     for i, softmax in enumerate(n for n in graph.node if n.op_type == "Softmax"):
         (qk,) = chain(softmax.input[0], ["MatMul"]) or [None]
         if qk is None:
             continue
-        q_mul = chain(qk.input[0], ["Mul"])
-        k_path = chain(qk.input[1], ["Mul", "Reshape", "Transpose", "Reshape"])
-        out_path = chain_down(
-            softmax.output[0], ["MatMul", "Reshape", "Transpose", "Reshape"]
-        )
-        if q_mul is None or k_path is None or out_path is None:
-            continue
-        (av, heads_out, _, reshape) = out_path
-        (batch, heads, tokens, channels) = shapes[q_mul[0].input[0]]
         p = f"attention{i}_"
-        # q and k in (batch, tokens, heads * channels), v in (batch, heads,
-        # tokens, channels), which the op takes as it is.
-        q_shape = numpy_helper.from_array(
-            np.array([batch, tokens, heads * channels], np.int64), p + "q_shape"
+        if (
+            (q_path := chain(qk.input[0], ["Mul"]))
+            and (
+                k_path := chain(qk.input[1], ["Mul", "Reshape", "Transpose", "Reshape"])
+            )
+            and (
+                out_path := chain_down(
+                    softmax.output[0], ["MatMul", "Reshape", "Transpose", "Reshape"]
+                )
+            )
+            and -1 not in shapes.get(q_path[0].input[0], [-1])
+        ):
+            (av, before, _, reshape) = out_path
+            (batch, heads, tokens, channels) = shapes[q_path[0].input[0]]
+            # q in (batch, tokens, heads * channels), and k as v is, in
+            # (batch, heads, tokens, channels).
+            q_shape = shape(p + "q_shape", [batch, tokens, heads * channels])
+            k_shape = shape(p + "k_shape", [batch, heads, tokens, channels])
+            nodes = [
+                helper.make_node(
+                    "Transpose", [q_path[0].input[0]], [p + "q_t"], perm=[0, 2, 1, 3]
+                ),
+                helper.make_node("Reshape", [p + "q_t", q_shape], [p + "q"]),
+                helper.make_node("Reshape", [k_path[3].input[0], k_shape], [p + "k"]),
+            ]
+            (k, v) = (p + "k", av.input[1])
+            # The op gives (batch, tokens, heads * channels), as the nodes
+            # before the Reshape did.
+            (output, after) = (reshape.input[0], [])
+        elif (
+            (q_path := chain(qk.input[0], ["Mul"]))
+            and (k_path := chain(qk.input[1], ["Mul", "Transpose"]))
+            and list(k_path[1].attribute[0].ints) == [0, 1, 3, 2]
+            and (out_path := chain_down(softmax.output[0], ["MatMul"]))
+            and len(q_dims := shapes.get(q_path[0].input[0], [])) == 4
+            and q_dims[1] == 1
+            and q_dims[3] != -1
+        ):
+            (before,) = out_path
+            (heads, channels) = (1, q_dims[3])
+            # q in (batch, tokens, channels), and k and v as they are.
+            q_shape = shape(p + "q_shape", [0, -1, channels])
+            out_shape = shape(p + "out_shape", [0, 1, -1, channels])
+            nodes = [
+                helper.make_node("Reshape", [q_path[0].input[0], q_shape], [p + "q"])
+            ]
+            (k, v) = (k_path[1].input[0], before.input[1])
+            (output, after) = (
+                before.output[0],
+                [helper.make_node("Reshape", [p + "out", out_shape], [p + "out_4d"])],
+            )
+        else:
+            continue
+        attention = helper.make_node(
+            "MultiHeadAttention",
+            [p + "q", k, v],
+            [p + "out"],
+            domain="com.microsoft",
+            num_heads=heads,
         )
-        k_shape = numpy_helper.from_array(
-            np.array([batch, heads, tokens, channels], np.int64), p + "k_shape"
-        )
-        graph.initializer.extend([q_shape, k_shape])
-        replacements[id(heads_out)] = [
-            helper.make_node(
-                "Transpose", [q_mul[0].input[0]], [p + "q_t"], perm=[0, 2, 1, 3]
-            ),
-            helper.make_node("Reshape", [p + "q_t", q_shape.name], [p + "q"]),
-            helper.make_node("Reshape", [k_path[3].input[0], k_shape.name], [p + "k"]),
-            helper.make_node(
-                "MultiHeadAttention",
-                [p + "q", p + "k", av.input[1]],
-                [p + "out"],
-                domain="com.microsoft",
-                num_heads=heads,
-                scale=scale(q_mul[0]) * scale(k_path[0]),
-            ),
-        ]
-        # The op gives (batch, tokens, heads * channels), as the Transpose and
-        # Reshape after it did.
-        reshape.input[0] = p + "out"
+        (q_scale, k_scale) = (scale(q_path[0]), scale(k_path[0]))
+        if q_scale is not None and k_scale is not None:
+            attention.attribute.append(
+                helper.make_attribute("scale", q_scale * k_scale)
+            )
+        elif q_scale is not None or k_scale is not None:
+            continue
+        replacements[id(before)] = [*nodes, attention, *after]
+        fused = (after or [attention])[-1].output[0]
+        for node in consumers[output]:
+            node.input[:] = [fused if x == output else x for x in node.input]
     nodes = []
     for node in graph.node:
         nodes.extend(replacements.get(id(node), []))
@@ -504,15 +555,22 @@ def _live_nodes(nodes: list[onnx.NodeProto], outputs: set[str]) -> list[onnx.Nod
 
 
 def _static_shapes(model: onnx.ModelProto) -> dict[str, list[int]]:
+    return {name: dims for name, dims in _shapes(model).items() if -1 not in dims}
+
+
+def _shapes(model: onnx.ModelProto) -> dict[str, list[int]]:
+    """The shape of each tensor of a known rank, with -1 for an unknown dim."""
     graph: onnx.GraphProto = onnx.shape_inference.infer_shapes(
         model, data_prop=True
     ).graph
-    shapes: dict[str, list[int]] = {}
-    for value in [*graph.input, *graph.value_info, *graph.output]:
-        dims = value.type.tensor_type.shape.dim
-        if all(d.HasField("dim_value") for d in dims):
-            shapes[value.name] = [d.dim_value for d in dims]
-    return shapes
+    return {
+        value.name: [
+            d.dim_value if d.HasField("dim_value") else -1
+            for d in value.type.tensor_type.shape.dim
+        ]
+        for value in [*graph.input, *graph.value_info, *graph.output]
+        if value.type.tensor_type.HasField("shape")
+    }
 
 
 def _all_nodes(graph: onnx.GraphProto):

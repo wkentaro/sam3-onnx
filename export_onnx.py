@@ -3,6 +3,7 @@
 import argparse
 import copy
 import pathlib
+import shutil
 import typing
 
 import imgviz
@@ -148,8 +149,6 @@ def _export_image_encoder(
         sam3.model.vitdet.apply_rotary_enc2 = apply_rotary_enc2
         logger.debug("exported onnx model: {!r}", str(onnx_file))
         _postprocess(onnx_file)
-        if fused:
-            fuse_attention(onnx_file)
 
     session: onnxruntime.InferenceSession = onnxruntime.InferenceSession(onnx_file)
     output = session.run(None, {"image": pixels})
@@ -817,6 +816,13 @@ def _export_tracker_models(
             "obj_ptr_tpos": {0: "num_ptrs"},
         },
     )
+    # The logits of its cross-attention grow with each frame, and CUDA's shared
+    # arena keeps a new region for them per frame until it runs out of memory.
+    # CUDA runs this copy, whose fused attention never holds them.
+    fused_file = pathlib.Path("models/sam3_memory_attention_fused.onnx")
+    if not fused_file.exists():
+        shutil.copy("models/sam3_memory_attention.onnx", fused_file)
+        fuse_attention(fused_file)
     # CoreML can't compile an input whose shape changes, so it takes this copy,
     # padded to the memories and pointers of one conditioning frame. Other
     # providers run the model above, which is faster for them.
