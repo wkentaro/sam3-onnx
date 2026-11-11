@@ -149,6 +149,8 @@ def _export_image_encoder(
         sam3.model.vitdet.apply_rotary_enc2 = apply_rotary_enc2
         logger.debug("exported onnx model: {!r}", str(onnx_file))
         _postprocess(onnx_file)
+        if fused:
+            fuse_attention(onnx_file)
 
     session: onnxruntime.InferenceSession = onnxruntime.InferenceSession(onnx_file)
     output = session.run(None, {"image": pixels})
