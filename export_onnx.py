@@ -369,6 +369,7 @@ def _export_decoder(
         )
         logger.debug("exported onnx model: {!r}", str(onnx_file))
         _postprocess(onnx_file)
+        fuse_attention(onnx_file)
 
     session = onnxruntime.InferenceSession(onnx_file)
     output = session.run(
