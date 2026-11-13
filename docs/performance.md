@@ -24,7 +24,7 @@ The decoder's attention runs as `MultiHeadAttention` on every device, as CoreML 
 
 ## CoreML
 
-`--device coreml` runs the image encoder on the GPU through CoreML, 3 times as fast as WebGPU runs it. It also runs `sam3_memory_attention_fixed.onnx`, a copy of the tracker's memory attention padded to a fixed shape, in about half the time WebGPU takes for the one whose input grows as frames fill the memory. CoreML can't compile an input whose shape changes, so the other models run on WebGPU when the `webgpu` group is installed, and on the CPU without it. With `--fp16` on an M5, a text prompt on an image takes 1.2 s and a tracked video frame of one object takes 1.2 s.
+`--device coreml` runs the image encoder on the GPU through CoreML, 3 times as fast as WebGPU runs it. It also runs `sam3_memory_attention_fixed.onnx`, a copy of the tracker's memory attention padded to the most memories and object pointers the tracker gives, in about half the time WebGPU takes for the one whose input grows as frames fill the memory, so every tracked frame runs it. CoreML can't compile an input whose shape changes, so the other models run on WebGPU when the `webgpu` group is installed, and on the CPU without it. With `--fp16` on an M5, a text prompt on an image takes 1.2 s, and a tracked video frame takes 1.1 s for one object and 1.7 s for the 2 people a text prompt finds.
 
 ## int8
 
