@@ -2,6 +2,8 @@ import numpy as np
 
 from infer_video_onnx import draw
 from track_onnx import FAR_OLD_FRAMES
+from track_onnx import FIXED_NUM_MEMORIES
+from track_onnx import FIXED_NUM_OBJ_PTRS
 from track_onnx import MAX_OBJ_PTRS_IN_ENCODER
 from track_onnx import Tracker
 from track_onnx import _new_output_dict
@@ -129,14 +131,14 @@ def test_pad_memory_attention_inputs() -> None:
         obj_ptrs=np.ones((5, 256), np.float32),
         obj_ptr_tpos=np.arange(5, dtype=np.float32),
     )
-    assert inputs["memory"].shape == (7, 64, 72, 72)
-    assert inputs["memory_tpos"].tolist() == [6, 5, 4, 0, 0, 0, 0]
+    assert inputs["memory"].shape == (FIXED_NUM_MEMORIES, 64, 72, 72)
+    assert inputs["memory_tpos"].tolist() == [6, 5, 4] + [0] * (FIXED_NUM_MEMORIES - 3)
     assert inputs["memory_tpos"].dtype == np.int64
-    assert inputs["obj_ptrs"].shape == (16, 256)
-    assert inputs["obj_ptr_tpos"].shape == (16,)
+    assert inputs["obj_ptrs"].shape == (FIXED_NUM_OBJ_PTRS, 256)
+    assert inputs["obj_ptr_tpos"].shape == (FIXED_NUM_OBJ_PTRS,)
     # The padding is marked invalid, and holds nothing.
-    assert inputs["memory_valid"].tolist() == [1, 1, 1, 0, 0, 0, 0]
-    assert inputs["obj_ptr_valid"].tolist() == [1] * 5 + [0] * 11
+    assert inputs["memory_valid"].tolist() == [1] * 3 + [0] * (FIXED_NUM_MEMORIES - 3)
+    assert inputs["obj_ptr_valid"].tolist() == [1] * 5 + [0] * (FIXED_NUM_OBJ_PTRS - 5)
     assert not inputs["memory"][3:].any() and not inputs["obj_ptrs"][5:].any()
     # No pointers at all, as reverse tracking from the last frame has.
     empty = _pad_memory_attention_inputs(

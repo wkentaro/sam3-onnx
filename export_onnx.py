@@ -32,6 +32,7 @@ from postprocess_onnx import fuse_attention
 from postprocess_onnx import postprocess
 from track_onnx import FIXED_NUM_MEMORIES
 from track_onnx import FIXED_NUM_OBJ_PTRS
+from track_onnx import NUM_MASKMEM
 
 MAX_BOXES: int = 16
 
@@ -846,7 +847,8 @@ def _export_tracker_models(
         inputs={
             "image_embeddings": image_embeddings,
             "memory": rng.normal(size=(num_memories, 64, 72, 72)).astype(np.float32),
-            "memory_tpos": np.arange(num_memories)[::-1].copy(),
+            # Padding repeats valid positions, which the mask gives no weight.
+            "memory_tpos": np.arange(num_memories)[::-1] % NUM_MASKMEM,
             "obj_ptrs": rng.normal(size=(num_ptrs, 256)).astype(np.float32),
             "obj_ptr_tpos": (np.arange(num_ptrs) / 15).astype(np.float32),
             "memory_valid": np.ones(num_memories, dtype=np.float32),

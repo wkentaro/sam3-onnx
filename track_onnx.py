@@ -34,9 +34,10 @@ MAX_POINT_NUM_IN_PROMPT_ENC: int = 16
 FAR_OLD_FRAMES: int = 20
 
 # The memories and object pointers that sam3_memory_attention_fixed.onnx takes:
-# those of one conditioning frame. More conditioning frames give up to 10 and 19.
-FIXED_NUM_MEMORIES: int = NUM_MASKMEM
-FIXED_NUM_OBJ_PTRS: int = MAX_OBJ_PTRS_IN_ENCODER
+# the most that track_step gives, from MAX_COND_FRAMES_IN_ATTN conditioning
+# frames, so that CoreML runs every frame.
+FIXED_NUM_MEMORIES: int = MAX_COND_FRAMES_IN_ATTN + NUM_MASKMEM - 1
+FIXED_NUM_OBJ_PTRS: int = MAX_COND_FRAMES_IN_ATTN + MAX_OBJ_PTRS_IN_ENCODER - 1
 
 # The sessions Tracker runs, as models/sam3_{name}.onnx.
 MODEL_NAMES: tuple[str, ...] = (
@@ -448,8 +449,8 @@ class Tracker:
                 "obj_ptr_tpos": obj_ptr_tpos,
             }
             name = "memory_attention"
-            # The fixed-shape copy gives the same output, on CoreML. Prompts
-            # on several frames can pass its counts, which the other takes.
+            # The fixed-shape copy gives the same output, on CoreML. The copy of
+            # an older export holds fewer memories, and the other takes the rest.
             if (
                 "memory_attention_fixed" in self._sessions
                 and len(memory_tpos) <= FIXED_NUM_MEMORIES
