@@ -1,7 +1,6 @@
 import types
 
 import numpy as np
-import pytest
 
 from infer_video_onnx import draw
 from track_onnx import FAR_OLD_FRAMES
@@ -168,8 +167,12 @@ def test_tracker_rejects_old_fixed_memory_attention() -> None:
     Tracker(sessions, lambda _: [], 1, 1, 1)
     # An export from before the fixed model took the most memories.
     sessions["memory_attention_fixed"] = session("memory", 7)
-    with pytest.raises(ValueError, match="postprocess_onnx.py --fp16"):
+    try:
         Tracker(sessions, lambda _: [], 1, 1, 1)
+    except ValueError as e:
+        assert "postprocess_onnx.py --fp16" in str(e)
+    else:
+        raise AssertionError("an old fixed memory attention should raise")
 
 
 def test_draw() -> None:
