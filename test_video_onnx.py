@@ -1,8 +1,13 @@
+import types
+
 import numpy as np
 
 from infer_video_onnx import draw
 from track_onnx import FAR_OLD_FRAMES
+from track_onnx import FIXED_NUM_MEMORIES
+from track_onnx import FIXED_NUM_OBJ_PTRS
 from track_onnx import MAX_OBJ_PTRS_IN_ENCODER
+from track_onnx import MODEL_NAMES
 from track_onnx import Tracker
 from track_onnx import _new_output_dict
 from track_onnx import _pad_memory_attention_inputs
@@ -129,14 +134,14 @@ def test_pad_memory_attention_inputs() -> None:
         obj_ptrs=np.ones((5, 256), np.float32),
         obj_ptr_tpos=np.arange(5, dtype=np.float32),
     )
-    assert inputs["memory"].shape == (7, 64, 72, 72)
-    assert inputs["memory_tpos"].tolist() == [6, 5, 4, 0, 0, 0, 0]
+    assert inputs["memory"].shape == (FIXED_NUM_MEMORIES, 64, 72, 72)
+    assert inputs["memory_tpos"].tolist() == [6, 5, 4] + [0] * (FIXED_NUM_MEMORIES - 3)
     assert inputs["memory_tpos"].dtype == np.int64
-    assert inputs["obj_ptrs"].shape == (16, 256)
-    assert inputs["obj_ptr_tpos"].shape == (16,)
+    assert inputs["obj_ptrs"].shape == (FIXED_NUM_OBJ_PTRS, 256)
+    assert inputs["obj_ptr_tpos"].shape == (FIXED_NUM_OBJ_PTRS,)
     # The padding is marked invalid, and holds nothing.
-    assert inputs["memory_valid"].tolist() == [1, 1, 1, 0, 0, 0, 0]
-    assert inputs["obj_ptr_valid"].tolist() == [1] * 5 + [0] * 11
+    assert inputs["memory_valid"].tolist() == [1] * 3 + [0] * (FIXED_NUM_MEMORIES - 3)
+    assert inputs["obj_ptr_valid"].tolist() == [1] * 5 + [0] * (FIXED_NUM_OBJ_PTRS - 5)
     assert not inputs["memory"][3:].any() and not inputs["obj_ptrs"][5:].any()
     # No pointers at all, as reverse tracking from the last frame has.
     empty = _pad_memory_attention_inputs(
@@ -146,6 +151,28 @@ def test_pad_memory_attention_inputs() -> None:
         obj_ptr_tpos=np.zeros(0, np.float32),
     )
     assert not empty["obj_ptr_valid"].any()
+
+
+def test_tracker_rejects_old_fixed_memory_attention() -> None:
+    def session(name: str, num: int | str) -> types.SimpleNamespace:
+        inputs = [types.SimpleNamespace(name=name, shape=[num])]
+        outputs = [types.SimpleNamespace(name="single_obj_ptr")]
+        return types.SimpleNamespace(
+            get_inputs=lambda: inputs, get_outputs=lambda: outputs
+        )
+
+    sessions = {name: session("x", "num_objects") for name in MODEL_NAMES}
+    Tracker(sessions, lambda _: [], 1, 1, 1)
+    sessions["memory_attention_fixed"] = session("memory", FIXED_NUM_MEMORIES)
+    Tracker(sessions, lambda _: [], 1, 1, 1)
+    # An export from before the fixed model took the most memories.
+    sessions["memory_attention_fixed"] = session("memory", 7)
+    try:
+        Tracker(sessions, lambda _: [], 1, 1, 1)
+    except ValueError as e:
+        assert "postprocess_onnx.py --fp16" in str(e)
+    else:
+        raise AssertionError("an old fixed memory attention should raise")
 
 
 def test_draw() -> None:
@@ -165,5 +192,6 @@ if __name__ == "__main__":
     test_propagation_history()
     test_trim_far_old_memory()
     test_pad_memory_attention_inputs()
+    test_tracker_rejects_old_fixed_memory_attention()
     test_draw()
     print("ok")
