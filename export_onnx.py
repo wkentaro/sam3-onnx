@@ -770,13 +770,14 @@ def _export_tracker_models(
         dynamic_axes: dict[str, dict[int, str]] | None = None,
     ) -> None:
         onnx_file = pathlib.Path(f"models/sam3_{name}.onnx")
-        # Re-export a model that lacks a dynamic axis, like the memory encoder
-        # before video, which took low-res masks of a fixed size.
-        if onnx_file.exists() and not any(
-            dims[axis].dim_value
+        # Re-export a model whose input shapes differ, like the memory encoder
+        # before video, which took low-res masks of a fixed size, or the fixed
+        # memory attention before it took the most memories.
+        if onnx_file.exists() and all(
+            dim.dim_value == (0 if axis in dynamic else inputs[i.name].shape[axis])
             for i in onnx.load(onnx_file, load_external_data=False).graph.input
-            for dims in [i.type.tensor_type.shape.dim]
-            for axis in (dynamic_axes or {}).get(i.name, {})
+            for dynamic in [(dynamic_axes or {}).get(i.name, {})]
+            for axis, dim in enumerate(i.type.tensor_type.shape.dim)
         ):
             logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
             return
@@ -838,7 +839,7 @@ def _export_tracker_models(
         shutil.copy("models/sam3_memory_attention.onnx", fused_file)
         fuse_attention(fused_file)
     # CoreML can't compile an input whose shape changes, so it takes this copy,
-    # padded to the memories and pointers of one conditioning frame. Other
+    # padded to the most memories and pointers that track_step gives. Other
     # providers run the model above, which is faster for them.
     num_memories, num_ptrs = FIXED_NUM_MEMORIES, FIXED_NUM_OBJ_PTRS
     export(

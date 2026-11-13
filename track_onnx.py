@@ -186,6 +186,13 @@ class Tracker:
                 "the point decoder takes one object at a time, "
                 "re-export it with: uv run export_onnx.py"
             )
+        fixed = sessions.get("memory_attention_fixed")
+        shapes = {i.name: i.shape for i in fixed.get_inputs()} if fixed else {}
+        if shapes and shapes["memory"][0] != FIXED_NUM_MEMORIES:
+            raise ValueError(
+                "the fixed memory attention takes fewer memories, "
+                "re-export it with: uv run export_onnx.py"
+            )
         self._sessions = sessions
         self._get_features = get_features
         self._features_cache: tuple[int, list[NDArray]] | None = None
@@ -449,13 +456,8 @@ class Tracker:
                 "obj_ptr_tpos": obj_ptr_tpos,
             }
             name = "memory_attention"
-            # The fixed-shape copy gives the same output, on CoreML. The copy of
-            # an older export holds fewer memories, and the other takes the rest.
-            if (
-                "memory_attention_fixed" in self._sessions
-                and len(memory_tpos) <= FIXED_NUM_MEMORIES
-                and obj_ptrs.shape[1] <= FIXED_NUM_OBJ_PTRS
-            ):
+            # The fixed-shape copy gives the same output, on CoreML.
+            if "memory_attention_fixed" in self._sessions:
                 name = "memory_attention_fixed"
                 inputs = _pad_memory_attention_inputs(**inputs)
             outputs.append(
