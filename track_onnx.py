@@ -191,7 +191,9 @@ class Tracker:
         if shapes and shapes["memory"][0] != FIXED_NUM_MEMORIES:
             raise ValueError(
                 "the fixed memory attention takes fewer memories, "
-                "re-export it with: uv run export_onnx.py"
+                "re-export it with: uv run export_onnx.py, and its float16 copy "
+                "with: uv run postprocess_onnx.py --fp16 "
+                "models/sam3_memory_attention_fixed.onnx"
             )
         self._sessions = sessions
         self._get_features = get_features

@@ -1,10 +1,14 @@
+import types
+
 import numpy as np
+import pytest
 
 from infer_video_onnx import draw
 from track_onnx import FAR_OLD_FRAMES
 from track_onnx import FIXED_NUM_MEMORIES
 from track_onnx import FIXED_NUM_OBJ_PTRS
 from track_onnx import MAX_OBJ_PTRS_IN_ENCODER
+from track_onnx import MODEL_NAMES
 from track_onnx import Tracker
 from track_onnx import _new_output_dict
 from track_onnx import _pad_memory_attention_inputs
@@ -150,6 +154,24 @@ def test_pad_memory_attention_inputs() -> None:
     assert not empty["obj_ptr_valid"].any()
 
 
+def test_tracker_rejects_old_fixed_memory_attention() -> None:
+    def session(name: str, num: int | str) -> types.SimpleNamespace:
+        inputs = [types.SimpleNamespace(name=name, shape=[num])]
+        outputs = [types.SimpleNamespace(name="single_obj_ptr")]
+        return types.SimpleNamespace(
+            get_inputs=lambda: inputs, get_outputs=lambda: outputs
+        )
+
+    sessions = {name: session("x", "num_objects") for name in MODEL_NAMES}
+    Tracker(sessions, lambda _: [], 1, 1, 1)
+    sessions["memory_attention_fixed"] = session("memory", FIXED_NUM_MEMORIES)
+    Tracker(sessions, lambda _: [], 1, 1, 1)
+    # An export from before the fixed model took the most memories.
+    sessions["memory_attention_fixed"] = session("memory", 7)
+    with pytest.raises(ValueError, match="postprocess_onnx.py --fp16"):
+        Tracker(sessions, lambda _: [], 1, 1, 1)
+
+
 def test_draw() -> None:
     frame = np.zeros((4, 4, 3), np.uint8)
     masks = np.zeros((2, 4, 4), np.bool_)
@@ -167,5 +189,6 @@ if __name__ == "__main__":
     test_propagation_history()
     test_trim_far_old_memory()
     test_pad_memory_attention_inputs()
+    test_tracker_rejects_old_fixed_memory_attention()
     test_draw()
     print("ok")
